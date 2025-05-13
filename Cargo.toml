@@ -1,0 +1,14 @@
+[package]
+name = "s3-hyperdir"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4.25"
+tokio = { version = "1", features = ["full"] }
+libc = "0.2.170"
+btree-ondisk = { version = "0.13.0", path = "../btree-ondisk", default-features = false }
+hyperfile = { version = "0.1.0", path = "../hyperfile-staging" }
+
+[features]
+default = []
