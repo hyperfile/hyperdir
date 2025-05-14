@@ -3,6 +3,12 @@ use log::warn;
 use hyperfile::ondisk::InodeRaw;
 
 pub(crate) const DEFAULT_NAME_LEN: usize = 255;
+const _DUMMY_FILENAME: [u8; DEFAULT_NAME_LEN + 1] = [0xFFu8; DEFAULT_NAME_LEN + 1];
+pub(crate) const DUMMY_FILENAME: [u8; DEFAULT_NAME_LEN + 1] = {
+    let mut n = _DUMMY_FILENAME;
+    n[DEFAULT_NAME_LEN] = 0;
+    n
+};
 
 // define dir file's inode
 pub struct DirFileInodeRaw {
@@ -85,5 +91,16 @@ impl DirFileEntryRaw {
                 std::mem::size_of::<Self>()
             )
         }
+    }
+
+    pub(crate) fn dummy_value() -> Self {
+        Self {
+            inode: InodeRaw::default(),
+            name: DUMMY_FILENAME,
+        }
+    }
+
+    pub(crate) fn is_dummy(&self) -> bool {
+        &self.name == &DUMMY_FILENAME
     }
 }

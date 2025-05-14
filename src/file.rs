@@ -1,6 +1,9 @@
 use std::io::{Result, Error, ErrorKind};
 use std::time::{Instant, Duration};
 use std::sync::Arc;
+use std::ffi::OsStr;
+use std::collections::HashMap;
+use log::warn;
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use btree_ondisk::{BlockLoader, bmap::BMap, NodeValue};
 use hyperfile::file::{HyperTrait, DirtyDataBlocks};
@@ -10,10 +13,10 @@ use hyperfile::inode::{Inode, FlushInodeFlag};
 use hyperfile::config::{HyperFileConfig, HyperFileMetaConfig};
 use hyperfile::staging::Staging;
 use hyperfile::segment::SegmentReadWrite;
-use hyperfile::meta_loader::s3::S3BlockLoader;
 use hyperfile::file::flags::HyperFileFlags;
 use hyperfile::ondisk::{BMapRawType, InodeRaw};
 use super::ondisk::{DirFileEntryRaw, DEFAULT_NAME_LEN};
+use super::{DirStaging, DirScatterInode, DirScatterInodeOp};
 
 const DIR_FILE_ENTRY_RAW_SIZE: usize = std::mem::size_of::<DirFileEntryRaw>();
 
@@ -66,7 +69,7 @@ pub struct HyperDirFile<'a, T, L: BlockLoader<BlockPtr>> {
 
 impl<'a, T, L> HyperDirFile<'a, T, L>
     where
-        T: Staging<T, L> + SegmentReadWrite,
+        T: Staging<T, L> + SegmentReadWrite + DirStaging,
         L: BlockLoader<BlockPtr> + Clone,
 {
     pub async fn new(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
@@ -154,7 +157,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             config: config,
             flags: flags,
             last_flush: Instant::now(),
-            sema: Arc::new(Semaphore::new(1)),
+            sema: Arc::new(Semaphore::new(permits)),
             inode: Inode::from_raw(&raw_inode, inode_state),
         };
 		// refresh bmap if need to do recovery
@@ -185,6 +188,134 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
 		self.inode.set_last_ondisk_cno(self.inode.get_last_cno());
 		Ok(())
 	}
+
+    pub async fn read_entry(&self, hash: &EntryNameHash) -> Result<DirFileEntry> {
+        let entry_raw = self.bmap.lookup(hash).await?;
+        Ok(DirFileEntry::from_raw(&entry_raw))
+    }
+
+    pub async fn read_dir(&mut self) -> Result<Vec<DirFileEntry>> {
+        // #1. list all inodes
+        let v_scattered_inodes = self.staging.list_scatter_inodes().await?;
+        // build all scatters key list
+        let v_all_scatters_key: Vec<String> = v_scattered_inodes.iter().map(|s| s.key.to_owned()).collect();
+
+        // #2. dedup inodes to get latest view and fetch inode raw
+        let v_last_view = DirScatterInode::filter_last_view(v_scattered_inodes);
+
+        // group by fetch and remove op
+        let mut v_removed = Vec::new();
+        let mut v_fetch = Vec::new();
+        for scatter in v_last_view.into_iter() {
+            match scatter.op {
+                DirScatterInodeOp::Unkown => {
+                    warn!("a scatter inode of unkown op: {}", scatter.key);
+                },
+                DirScatterInodeOp::Delete => {
+                    v_removed.push(scatter);
+                },
+                _ => {
+                    v_fetch.push(scatter);
+                },
+            }
+        }
+        let v_fetched_scattered_inodes = self.staging.collect_scatter_inodes(v_fetch).await?;
+
+        // #3. transform
+        let mut v_transformed_scattered_inodes: HashMap<EntryNameHash, DirFileEntryRaw> = HashMap::new();
+        for (scatter, bytes) in v_fetched_scattered_inodes.into_iter() {
+            // calc crc64
+            let mut c = crc64fast::Digest::new();
+            c.write(scatter.filename.as_bytes());
+            let hashed_name = c.sum64();
+            // convert bytes to inode raw
+            let inode_raw = InodeRaw::from_u8_slice(&bytes);
+            // filename into OsStr
+            let entry_raw = DirFileEntryRaw::from(&inode_raw, <String as AsRef<OsStr>>::as_ref(&scatter.filename).as_encoded_bytes());
+            v_transformed_scattered_inodes.insert(hashed_name, entry_raw);
+        }
+
+        // #4. apply changed and deleted into bmap
+        // apply changed
+        for (hashed_name, _) in v_transformed_scattered_inodes.iter() {
+            // force update bmap
+            let _ = self.bmap.insert(*hashed_name, DirFileEntryRaw::dummy_value()).await?;
+        }
+        // apply deleted
+        for scatter in v_removed.iter() {
+            // calc crc64
+            let mut c = crc64fast::Digest::new();
+            c.write(scatter.filename.as_bytes());
+            let hashed_name = c.sum64();
+            match self.bmap.delete(&hashed_name).await {
+                Ok(_) => {},
+                Err(e) => {
+                    if e.kind() != ErrorKind::NotFound {
+                        return Err(e);
+                    }
+                    // if not found means file not exists in bmap,
+                    // let's ignore and continue
+                },
+            }
+        }
+
+        // #5. read in all K/V from bmap to get latest view
+        // temp hash map to hold latest view of dir elements need to be load from staging
+        let mut map: HashMap<EntryNameHash, DirFileEntryRaw> = HashMap::new();
+        // final view of dir elements
+        let mut last_view_map: HashMap<EntryNameHash, DirFileEntryRaw> = HashMap::new();
+
+        let opt_last_key = match self.bmap.last_key().await {
+            Ok(k) => { Some(k) },
+            Err(e) => {
+                if e.kind() != ErrorKind::NotFound {
+                    return Err(e);
+                }
+                None
+            },
+        };
+        // build temp map, bmap including dummy value
+        if let Some(last_key) = opt_last_key {
+            let mut n = 0;
+            while n <= last_key {
+                let key = self.bmap.seek_key(&n).await?;
+                let val = self.bmap.lookup(&key.clone()).await?;
+                map.insert(key.clone(), val);
+                if key > n {
+                    // n not found in bmap, reset n with key for next
+                    n = key;
+                } else {
+                    // if n == key, incr n for next
+                    n += 1;
+                }
+            }
+        }
+
+        // #6. load all inode from staging
+        for (hashed_name, entry_raw) in map.into_iter() {
+            if entry_raw.is_dummy() {
+                let Some(raw) = v_transformed_scattered_inodes.remove(&hashed_name) else {
+                    panic!("inconsistent - hashed name {} not found in transformed scatter inodes", hashed_name);
+                };
+                last_view_map.insert(hashed_name, raw);
+                continue;
+            }
+            last_view_map.insert(hashed_name, entry_raw);
+        }
+        assert!(v_transformed_scattered_inodes.len() == 0);
+
+        // #7. update bmap and flush
+        self.flush().await?;
+
+        // #8. cleanup
+        self.staging.remove_scatter_inodes(v_all_scatters_key).await?;
+
+        // #9. build result
+        let v: Vec<DirFileEntry> = last_view_map.into_iter()
+                .map(|(_, raw)| DirFileEntry::from_raw(&raw))
+                .collect();
+        Ok(v)
+    }
 }
 
 impl<'a, T, L> HyperTrait<'a, T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
@@ -192,15 +323,15 @@ impl<'a, T, L> HyperTrait<'a, T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
         T: Staging<T, L> + SegmentReadWrite,
         L: BlockLoader<BlockPtr> + Clone,
 {
-	fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr {
-		BlockPtrFormat::encode(segid, offset, seq, &self.bmap_ud.blk_ptr_format)
+	fn blk_ptr_encode(&self, _segid: SegmentId, _offset: SegmentOffset, _seq: usize) -> BlockPtr {
+		BlockPtr::invalid_value()
 	}
 
-	fn blk_ptr_decode(&self, blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset) {
-		BlockPtrFormat::decode(blk_ptr, &self.bmap_ud.blk_ptr_format)
+	fn blk_ptr_decode(&self, _blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset) {
+		(0, 0)
 	}
 
-    fn blk_ptr_decode_display(&self, blk_ptr: &BlockPtr) -> String {
+    fn blk_ptr_decode_display(&self, _blk_ptr: &BlockPtr) -> String {
         String::new()
     }
 
@@ -232,7 +363,7 @@ impl<'a, T, L> HyperTrait<'a, T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
         &mut self.bmap
     }
 
-    async fn bmap_insert_dummy_value(bmap: &mut BMap<'a, BlockIndex, DirFileEntryRaw, BlockPtr, L>, blk_idx: &BlockIndex) -> Result<Option<DirFileEntryRaw>> {
+    async fn bmap_insert_dummy_value(_bmap: &mut BMap<'a, BlockIndex, DirFileEntryRaw, BlockPtr, L>, _blk_idx: &BlockIndex) -> Result<Option<DirFileEntryRaw>> {
         Ok(None)
     }
 
