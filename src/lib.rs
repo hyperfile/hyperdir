@@ -24,6 +24,8 @@ pub trait DirStaging {
 pub mod ondisk;
 pub mod file;
 pub mod s3;
+pub mod hyper;
+pub mod fs;
 
 pub const DEFAULT_DIR_SUFFIX: &str = "_$folder$";
 pub const DEFAULT_DIR_FILE_FOLDER: &str = "$dirfile$";
