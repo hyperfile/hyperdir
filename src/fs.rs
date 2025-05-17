@@ -65,7 +65,7 @@ impl<'a> HyperDir<'a>
         self.inner.flush().await
     }
 
-    pub async fn fs_getattr(&mut self) -> Result<libc::stat>
+    pub fn fs_getattr(&self) -> Result<libc::stat>
     {
         debug!("fs_getattr - ");
         Ok(self.inner.stat())
