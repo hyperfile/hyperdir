@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use log::warn;
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use btree_ondisk::{BlockLoader, bmap::BMap, NodeValue};
+use btree_ondisk::btree::BtreeNodeDirty;
 use hyperfile::file::{HyperTrait, DirtyDataBlocks};
 use hyperfile::{BlockIndex, BlockPtr, SegmentId, SegmentOffset, BMapUserData};
 use hyperfile::meta_format::BlockPtrFormat;
@@ -318,7 +319,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     }
 }
 
-impl<'a, T, L> HyperTrait<'a, T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
+impl<'a, T, L> HyperTrait<T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
     where
         T: Staging<T, L> + SegmentReadWrite,
         L: BlockLoader<BlockPtr> + Clone,
@@ -355,24 +356,53 @@ impl<'a, T, L> HyperTrait<'a, T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
         drop(permit);
     }
 
-    fn bmap(&self) -> &BMap<'a, BlockIndex, DirFileEntryRaw, BlockPtr, L> {
-        &self.bmap
+    fn bmap_as_slice(&self) -> &[u8] {
+        self.bmap.as_slice()
     }
 
-    fn bmap_mut(&mut self) -> &mut BMap<'a, BlockIndex, DirFileEntryRaw, BlockPtr, L> {
-        &mut self.bmap
+    fn bmap_get_block_loader(&self) -> L {
+        self.bmap.get_block_loader()
     }
 
-    async fn bmap_insert_dummy_value(_bmap: &mut BMap<'a, BlockIndex, DirFileEntryRaw, BlockPtr, L>, _blk_idx: &BlockIndex) -> Result<Option<DirFileEntryRaw>> {
-        Ok(None)
+    fn bmap_dirty(&self) -> bool {
+        self.bmap.dirty()
+    }
+
+    fn bmap_lookup_dirty(&self) -> Vec<BtreeNodeDirty<'_, BlockIndex, DirFileEntryRaw, BlockPtr>> {
+        self.bmap.lookup_dirty()
+    }
+
+    async fn bmap_assign_meta_node(&self, blk_ptr: BlockPtr, node: BtreeNodeDirty<'_, BlockIndex, DirFileEntryRaw, BlockPtr>) -> Result<()> {
+        self.bmap.assign_meta_node(blk_ptr, node).await
+    }
+
+    async fn bmap_assign_data_node(&self, blk_idx: &BlockIndex, blk_ptr: BlockPtr) -> Result<()> {
+        self.bmap.assign_data_node(blk_idx, blk_ptr).await
+    }
+
+    fn bmap_clear_dirty(&mut self) {
+        self.bmap.clear_dirty()
+    }
+
+    fn bmap_update(&mut self, bmap: BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L>) {
+        *&mut self.bmap = unsafe {
+            std::mem::transmute::<BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L>, BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L>>(bmap)
+        };
+    }
+
+    async fn bmap_insert_dummy_value(bmap: &mut BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L>, blk_idx: &BlockIndex) -> Result<Option<DirFileEntryRaw>> {
+        bmap.insert(*blk_idx, DirFileEntryRaw::dummy_value()).await
     }
 
     fn inode(&self) -> &Inode {
         &self.inode
     }
 
-    fn inode_mut(&mut self) -> &mut Inode {
-        &mut self.inode
+    #[allow(mutable_transmutes)]
+    fn inode_mut(&self) -> &mut Inode {
+        unsafe {
+            std::mem::transmute::<&Inode, &mut Inode>(&self.inode)
+        }
     }
 
     fn staging(&self) -> &T {
