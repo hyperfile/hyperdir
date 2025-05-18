@@ -2,7 +2,7 @@ use std::io::{Result, Error, ErrorKind};
 use std::time::{Instant, Duration};
 use std::sync::Arc;
 use std::ffi::OsStr;
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
 use log::warn;
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use btree_ondisk::{BlockLoader, bmap::BMap, NodeValue};
@@ -350,7 +350,7 @@ impl<'a, T, L> HyperTrait<T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
     }
 
     fn get_data_blocks_dirty(&self) -> DirtyDataBlocks<'_> {
-        DirtyDataBlocks { inner: None, owned: None }
+        DirtyDataBlocks { inner: Some(BTreeMap::new()), owned: None }
     }
 
     fn clear_data_blocks_dirty(&mut self) {
