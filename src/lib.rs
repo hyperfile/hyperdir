@@ -17,6 +17,8 @@ pub trait DirStaging {
     async fn remove_scatter_inodes(&self, v: Vec<String>) -> Result<()>;
     // convert from file level staging to dir level
     fn to_dir_staging(staging: &Self) -> Self;
+    //convert from generic staging to dir staging
+    fn from_staging(staging: &Self) -> Self;
     // emit scatter event to dir location based on input file level staging
     async fn emit_scatter_event(&self, buf: &[u8], op: DirScatterInodeOp) -> Result<()>;
 }

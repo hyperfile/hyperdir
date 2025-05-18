@@ -113,6 +113,17 @@ impl DirStaging for S3Staging {
         staging
     }
 
+    fn from_staging(staging: &S3Staging) -> S3Staging {
+        let mut staging = staging.clone();
+        let path = std::path::Path::new(&staging.root_path);
+        let root_path = staging.root_path;
+
+        staging.root_path = format!("{}{}/{}", root_path, DEFAULT_DIR_SUFFIX, DEFAULT_DIR_FILE_FOLDER);
+        staging.root_path_slash = format!("{}/", staging.root_path);
+        staging.inode_file = format!("{}/inode", staging.root_path);
+        staging
+    }
+
     async fn emit_scatter_event(&self, buf: &[u8], op: DirScatterInodeOp) -> Result<()> {
         let (dir, filename) = self.dir_filename();
         let key = DirScatterInode::path_encode(dir, filename, op.clone() as u8);
