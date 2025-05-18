@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use bytes::Bytes;
 use ulid::Ulid;
 use base64::{engine, alphabet, Engine as _};
+use hyperfile::staging::config::StagingConfig;
 
 #[allow(async_fn_in_trait)]
 pub trait DirStaging {
@@ -17,8 +18,8 @@ pub trait DirStaging {
     async fn remove_scatter_inodes(&self, v: Vec<String>) -> Result<()>;
     // convert from file level staging to dir level
     fn to_dir_staging(staging: &Self) -> Self;
-    //convert from generic staging to dir staging
-    fn from_staging(staging: &Self) -> Self;
+    // convert from generic staging config to dir staging config
+    fn to_dir_staging_config(config: &StagingConfig) -> StagingConfig;
     // emit scatter event to dir location based on input file level staging
     async fn emit_scatter_event(&self, buf: &[u8], op: DirScatterInodeOp) -> Result<()>;
 }

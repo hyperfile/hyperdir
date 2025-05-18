@@ -3,6 +3,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use log::error;
 use aws_sdk_s3::primitives::SdkBody;
+use hyperfile::staging::config::StagingConfig;
 use hyperfile::staging::{Staging, s3::S3Staging};
 use super::{DirStaging, DirScatterInode, DirScatterInodeOp};
 use super::{DEFAULT_DIR_SUFFIX, DEFAULT_DIR_FILE_FOLDER, DEFAUTL_DIR_INODE_MARKER};
@@ -113,15 +114,13 @@ impl DirStaging for S3Staging {
         staging
     }
 
-    fn from_staging(staging: &S3Staging) -> S3Staging {
-        let mut staging = staging.clone();
-        let path = std::path::Path::new(&staging.root_path);
-        let root_path = staging.root_path;
+    fn to_dir_staging_config(config: &StagingConfig) -> StagingConfig {
+        let mut config = config.clone();
+        assert!(!config.root_uri.ends_with('/'));
 
-        staging.root_path = format!("{}{}/{}", root_path, DEFAULT_DIR_SUFFIX, DEFAULT_DIR_FILE_FOLDER);
-        staging.root_path_slash = format!("{}/", staging.root_path);
-        staging.inode_file = format!("{}/inode", staging.root_path);
-        staging
+        config.root_uri = format!("{}{}/{}", config.root_uri, DEFAULT_DIR_SUFFIX, DEFAULT_DIR_FILE_FOLDER);
+        config.inode_file_uri = format!("{}/inode", config.root_uri);
+        config
     }
 
     async fn emit_scatter_event(&self, buf: &[u8], op: DirScatterInodeOp) -> Result<()> {

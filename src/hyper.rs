@@ -29,8 +29,8 @@ impl<'a> HyperDir<'a> {
 
     pub async fn open(client: Client, file_config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
     {
-        let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
-        let staging = S3Staging::from_staging(&staging);
+        let dir_staging_config = S3Staging::to_dir_staging_config(&file_config.staging);
+        let staging = S3Staging::from(&client, dir_staging_config, file_config.runtime.clone()).await?;
         let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
         let file = HyperDirFile::<S3Staging, S3BlockLoader>::open(staging, loader, file_config, flags).await?;
         Ok(Self {
@@ -40,8 +40,8 @@ impl<'a> HyperDir<'a> {
 
     pub async fn create(client: Client, file_config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
     {
-        let staging = S3Staging::create(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
-        let staging = S3Staging::from_staging(&staging);
+        let dir_staging_config = S3Staging::to_dir_staging_config(&file_config.staging);
+        let staging = S3Staging::create(&client, dir_staging_config, file_config.runtime.clone()).await?;
         let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
         let file = HyperDirFile::<S3Staging, S3BlockLoader>::new(staging, loader, file_config, flags).await?;
         Ok(Self {
@@ -51,8 +51,8 @@ impl<'a> HyperDir<'a> {
 
     pub async fn stat_fast(client: Client, file_config: HyperFileConfig) -> Result<libc::stat>
     {
-        let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
-        let staging = S3Staging::from_staging(&staging);
+        let dir_staging_config = S3Staging::to_dir_staging_config(&file_config.staging);
+        let staging = S3Staging::from(&client, dir_staging_config, file_config.runtime.clone()).await?;
         let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
         HyperDirFile::<S3Staging, S3BlockLoader>::stat_fast(staging).await
     }
