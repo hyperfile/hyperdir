@@ -53,7 +53,6 @@ impl<'a> HyperDir<'a> {
     {
         let dir_staging_config = S3Staging::to_dir_staging_config(&file_config.staging);
         let staging = S3Staging::from(&client, dir_staging_config, file_config.runtime.clone()).await?;
-        let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
         HyperDirFile::<S3Staging, S3BlockLoader>::stat_fast(staging).await
     }
 }
