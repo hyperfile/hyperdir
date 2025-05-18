@@ -4,6 +4,7 @@ use hyperfile::staging::{Staging, s3::S3Staging};
 use hyperfile::meta_loader::s3_batch::S3BlockLoader;
 use hyperfile::file::flags::HyperFileFlags;
 use hyperfile::config::HyperFileConfig;
+use crate::DirStaging;
 use crate::file::HyperDirFile;
 
 pub struct HyperDir<'a> {
@@ -29,6 +30,7 @@ impl<'a> HyperDir<'a> {
     pub async fn open(client: Client, file_config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
     {
         let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
+        let staging = S3Staging::from_staging(&staging);
         let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
         let file = HyperDirFile::<S3Staging, S3BlockLoader>::open(staging, loader, file_config, flags).await?;
         Ok(Self {
@@ -39,6 +41,7 @@ impl<'a> HyperDir<'a> {
     pub async fn create(client: Client, file_config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
     {
         let staging = S3Staging::create(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
+        let staging = S3Staging::from_staging(&staging);
         let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
         let file = HyperDirFile::<S3Staging, S3BlockLoader>::new(staging, loader, file_config, flags).await?;
         Ok(Self {
