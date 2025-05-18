@@ -2,6 +2,7 @@ use std::io::Result;
 use log::debug;
 use aws_sdk_s3::Client;
 use hyperfile::file::flags::{FileFlags, HyperFileFlags};
+use hyperfile::file::mode::{FileMode, HyperFileMode};
 use hyperfile::config::HyperFileConfigBuilder;
 use hyperfile::config::HyperFileRuntimeConfig;
 use hyperfile::staging::{Staging, config::StagingConfig, s3::S3Staging};
@@ -34,7 +35,7 @@ impl<'a> HyperDir<'a>
         return Self::open(client.clone(), file_config, f).await;
     }
 
-    pub async fn fs_open_or_create_with_default_opt(client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
+    pub async fn fs_open_or_create_with_default_opt(client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
     {
         debug!("fs_open_or_create - uri: {}, flags: {}", uri, flags);
         let staging_config = StagingConfig::new_s3_uri(uri, None);
@@ -42,7 +43,8 @@ impl<'a> HyperDir<'a>
             .with_staging_config(&staging_config)
             .build();
         let f = HyperFileFlags::from_flags(flags);
-        return Self::do_open_or_create(client.clone(), file_config, f, true).await;
+        let m = HyperFileMode::from_mode(mode);
+        return Self::do_open_or_create(client.clone(), file_config, f, m, true).await;
     }
 
     pub async fn fs_unlink(client: &Client, uri: &str) -> Result<()>

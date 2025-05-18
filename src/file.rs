@@ -15,6 +15,7 @@ use hyperfile::config::{HyperFileConfig, HyperFileMetaConfig};
 use hyperfile::staging::{StagingIntercept, Staging, config::StagingConfig};
 use hyperfile::segment::SegmentReadWrite;
 use hyperfile::file::flags::HyperFileFlags;
+use hyperfile::file::mode::HyperFileMode;
 use hyperfile::ondisk::{BMapRawType, InodeRaw};
 use super::ondisk::{DirFileEntryRaw, DEFAULT_NAME_LEN};
 use super::{DirStaging, DirScatterInode, DirScatterInodeOp};
@@ -73,13 +74,15 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         T: Staging<T, L> + SegmentReadWrite + DirStaging,
         L: BlockLoader<BlockPtr> + Clone,
 {
-    pub async fn new(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags) -> Result<Self>
+    pub async fn new(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags, mode: HyperFileMode) -> Result<Self>
     {
         let meta_config = config.meta.clone();
 
         let bmap = BMap::<BlockIndex, DirFileEntryRaw, BlockPtr, L>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader);
 
-        let inode = Inode::default_dir();
+        let inode = Inode::default_dir()
+            .with_mode(&mode)
+            .with_meta_config(&meta_config);
         let bmap_ud = BMapUserData::new(BlockPtrFormat::Nop);
         bmap.set_userdata(bmap_ud.as_u32());
 
@@ -130,9 +133,6 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
                 inode_state = od_state;
             },
             Err(e) => {
-                if e.kind() == ErrorKind::NotFound {
-                    return Self::new(staging, meta_block_loader, config, flags).await;
-                }
                 return Err(e);
             },
         }
