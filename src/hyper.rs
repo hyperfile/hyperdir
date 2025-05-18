@@ -48,4 +48,12 @@ impl<'a> HyperDir<'a> {
             inner: file,
         })
     }
+
+    pub async fn stat_fast(client: Client, file_config: HyperFileConfig) -> Result<libc::stat>
+    {
+        let staging = S3Staging::from(&client, file_config.staging.clone(), file_config.runtime.clone()).await?;
+        let staging = S3Staging::from_staging(&staging);
+        let loader = S3BlockLoader::new(&client, &staging.bucket, staging.root_path());
+        HyperDirFile::<S3Staging, S3BlockLoader>::stat_fast(staging).await
+    }
 }
