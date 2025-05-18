@@ -12,7 +12,7 @@ use hyperfile::{BlockIndex, BlockPtr, SegmentId, SegmentOffset, BMapUserData};
 use hyperfile::meta_format::BlockPtrFormat;
 use hyperfile::inode::{Inode, FlushInodeFlag};
 use hyperfile::config::{HyperFileConfig, HyperFileMetaConfig};
-use hyperfile::staging::Staging;
+use hyperfile::staging::{StagingIntercept, Staging, config::StagingConfig};
 use hyperfile::segment::SegmentReadWrite;
 use hyperfile::file::flags::HyperFileFlags;
 use hyperfile::ondisk::{BMapRawType, InodeRaw};
@@ -198,6 +198,14 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
 		self.inode.set_last_ondisk_cno(self.inode.get_last_cno());
 		Ok(())
 	}
+
+    pub fn staging_config(&self) -> &StagingConfig {
+        &self.config.staging
+    }
+
+    pub fn staging_interceptor(&mut self, i: impl StagingIntercept<T> + 'static) {
+        self.staging.interceptor(i);
+    }
 
     pub async fn read_entry(&self, hash: &EntryNameHash) -> Result<DirFileEntry> {
         let entry_raw = self.bmap.lookup(hash).await?;

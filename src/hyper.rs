@@ -1,6 +1,6 @@
 use std::io::{Result, ErrorKind};
 use aws_sdk_s3::Client;
-use hyperfile::staging::{Staging, s3::S3Staging};
+use hyperfile::staging::{Staging, StagingIntercept, config::StagingConfig, s3::S3Staging};
 use hyperfile::meta_loader::s3_batch::S3BlockLoader;
 use hyperfile::file::flags::HyperFileFlags;
 use hyperfile::config::HyperFileConfig;
@@ -54,5 +54,16 @@ impl<'a> HyperDir<'a> {
         let dir_staging_config = S3Staging::to_dir_staging_config(&file_config.staging);
         let staging = S3Staging::from(&client, dir_staging_config, file_config.runtime.clone()).await?;
         HyperDirFile::<S3Staging, S3BlockLoader>::stat_fast(staging).await
+    }
+}
+
+/// expose helper fn
+impl<'a> HyperDir<'a> {
+    pub fn staging_config(&self) -> &StagingConfig {
+        self.inner.staging_config()
+    }
+
+    pub fn with_staging_interceptor(&mut self, i: impl StagingIntercept<S3Staging> + 'static) {
+        self.inner.staging_interceptor(i)
     }
 }
