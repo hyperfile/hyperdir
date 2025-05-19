@@ -341,16 +341,28 @@ impl<'a, T, L> HyperTrait<T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
         T: Staging<T, L> + SegmentReadWrite,
         L: BlockLoader<BlockPtr> + Clone,
 {
-	fn blk_ptr_encode(&self, _segid: SegmentId, _offset: SegmentOffset, _seq: usize) -> BlockPtr {
-		BlockPtr::invalid_value()
+	fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr {
+        BlockPtrFormat::encode(segid, offset, seq, &self.bmap_ud.blk_ptr_format)
 	}
 
-	fn blk_ptr_decode(&self, _blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset) {
-		(0, 0)
+	fn blk_ptr_decode(&self, blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset) {
+        BlockPtrFormat::decode(blk_ptr, &self.bmap_ud.blk_ptr_format)
 	}
 
-    fn blk_ptr_decode_display(&self, _blk_ptr: &BlockPtr) -> String {
-        String::new()
+    fn blk_ptr_decode_display(&self, blk_ptr: &BlockPtr) -> String {
+        if BlockPtrFormat::is_dummy_value(blk_ptr) {
+            return format!("[Dummy]");
+        } else if BlockPtrFormat::is_invalid_value(blk_ptr) {
+            return format!("[Invalid]");
+        } else if BlockPtrFormat::is_zero_block(blk_ptr) {
+            return format!("[Zero Block]");
+        } else if BlockPtrFormat::is_on_staging(blk_ptr) {
+            let (id, off) = self.blk_ptr_decode(blk_ptr);
+            let group_id = BlockPtrFormat::decode_micro_group_id(blk_ptr);
+            return format!("[Staging: id {} - offset {} - group {}]", id, off, group_id);
+        } else {
+            return format!("[Unkown: 0x{:x}]", blk_ptr);
+        }
     }
 
     fn clear_data_blocks_cache(&mut self) {
