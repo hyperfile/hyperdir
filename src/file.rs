@@ -255,9 +255,9 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
 
         // #4. apply changed and deleted into bmap
         // apply changed
-        for (hashed_name, _) in v_transformed_scattered_inodes.iter() {
+        for (hashed_name, entry_raw) in v_transformed_scattered_inodes.iter() {
             // force update bmap
-            let _ = self.bmap.insert(*hashed_name, DirFileEntryRaw::dummy_value()).await?;
+            let _ = self.bmap.insert(*hashed_name, *entry_raw).await?;
         }
         // apply deleted
         for scatter in v_removed.iter() {
@@ -309,18 +309,11 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             }
         }
 
-        // #6. load all inode from staging
+        // #6. build last view map
         for (hashed_name, entry_raw) in map.into_iter() {
-            if entry_raw.is_dummy() {
-                let Some(raw) = v_transformed_scattered_inodes.remove(&hashed_name) else {
-                    panic!("inconsistent - hashed name {} not found in transformed scatter inodes", hashed_name);
-                };
-                last_view_map.insert(hashed_name, raw);
-                continue;
-            }
             last_view_map.insert(hashed_name, entry_raw);
         }
-        assert!(v_transformed_scattered_inodes.len() == 0);
+        drop(v_transformed_scattered_inodes);
 
         // #7. update bmap and flush
         self.flush().await?;
