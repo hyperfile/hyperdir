@@ -35,7 +35,11 @@ pub struct DirFileEntryRaw {
 
 impl fmt::Display for DirFileEntryRaw {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", std::str::from_utf8(&self.name).unwrap())
+        if self.is_dummy() {
+            write!(f, "[DUMMRY VALUE ENTRY]")
+        } else {
+            write!(f, "{}", std::str::from_utf8(&self.name).unwrap())
+        }
     }
 }
 
