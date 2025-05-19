@@ -2,6 +2,7 @@ use std::io::{Result, Error, ErrorKind};
 use std::time::{Instant, Duration};
 use std::sync::Arc;
 use std::ffi::OsStr;
+use std::ffi::CStr;
 use std::collections::{HashMap, BTreeMap};
 use log::warn;
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
@@ -30,9 +31,22 @@ pub struct DirFileEntry {
 
 impl DirFileEntry {
     fn from_raw(raw: &DirFileEntryRaw) -> Self {
-        let name = match std::str::from_utf8(&raw.name) {
-            Ok(s) => { s.to_owned() },
-            Err(_) => { String::new() }, // invalid filename
+        let name = match CStr::from_bytes_until_nul(&raw.name) {
+            Ok(cstr) => {
+                match cstr.to_str() {
+                    Ok(s) => { s.to_string() },
+                    Err(e) => {
+                        // invalid filename
+                        warn!("decode file name error: {}", e);
+                        String::new()
+                    },
+                }
+            },
+            Err(e) => {
+                // invalid filename
+                warn!("decode file name error: {}", e);
+                String::new()
+            },
         };
 
         Self {
