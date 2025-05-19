@@ -33,6 +33,7 @@ pub mod fs;
 pub const DEFAULT_DIR_SUFFIX: &str = "_$folder$";
 pub const DEFAULT_DIR_FILE_FOLDER: &str = "$dirfile$";
 pub const DEFAUTL_DIR_INODE_MARKER: &str = "_$folder$/inode_";
+pub const DEFAULT_DIR_FILE_SUFFIX: &str = "_$folder$/$dirfile$";
 
 #[derive(Clone, Debug)]
 #[repr(u8)]

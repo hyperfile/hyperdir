@@ -6,7 +6,7 @@ use aws_sdk_s3::primitives::SdkBody;
 use hyperfile::staging::config::StagingConfig;
 use hyperfile::staging::{Staging, s3::S3Staging};
 use super::{DirStaging, DirScatterInode, DirScatterInodeOp};
-use super::{DEFAULT_DIR_SUFFIX, DEFAULT_DIR_FILE_FOLDER, DEFAUTL_DIR_INODE_MARKER};
+use super::{DEFAULT_DIR_SUFFIX, DEFAULT_DIR_FILE_FOLDER, DEFAUTL_DIR_INODE_MARKER, DEFAULT_DIR_FILE_SUFFIX};
 
 impl DirStaging for S3Staging {
     async fn list_scatter_inodes(&self) -> Result<Vec<DirScatterInode>> {
@@ -125,6 +125,13 @@ impl DirStaging for S3Staging {
 
     async fn emit_scatter_event(&self, buf: &[u8], op: DirScatterInodeOp) -> Result<()> {
         let (dir, filename) = self.dir_filename();
+        // NOTE: dir staging return filename carry with dir file suffix
+        // trim end suffix if we have
+        let filename = if filename.ends_with(DEFAULT_DIR_FILE_SUFFIX) {
+            filename.trim_end_matches(DEFAULT_DIR_FILE_SUFFIX)
+        } else {
+            filename
+        };
         let key = DirScatterInode::path_encode(dir, filename, op.clone() as u8);
         let builder = self.client
             .put_object()
