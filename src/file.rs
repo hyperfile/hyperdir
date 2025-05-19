@@ -83,7 +83,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         let inode = Inode::default_dir()
             .with_mode(&mode)
             .with_meta_config(&meta_config);
-        let bmap_ud = BMapUserData::new(BlockPtrFormat::Nop);
+        let bmap_ud = BMapUserData::new(BlockPtrFormat::Flat);
         bmap.set_userdata(bmap_ud.as_u32());
 
 		let mut file = Self {
