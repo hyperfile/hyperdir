@@ -79,6 +79,15 @@ impl<'a> HyperDir<'a>
         staging.unlink().await
     }
 
+    pub async fn fs_unlink_with_interceptor(client: &Client, uri: &str, interceptor: impl StagingIntercept<S3Staging> + 'static) -> Result<()>
+    {
+        debug!("fs_unlink_with_interceptor - uri: {}", uri);
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        let mut staging = S3Staging::from(client, staging_config, HyperFileRuntimeConfig::default()).await?;
+        staging.interceptor(interceptor);
+        staging.unlink().await
+    }
+
     pub async fn fs_release(&mut self) -> Result<u64>
     {
         debug!("fs_release - ");
