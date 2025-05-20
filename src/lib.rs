@@ -40,7 +40,8 @@ pub const DEFAULT_DIR_FILE_SUFFIX: &str = "_$folder$/$dirfile$";
 pub enum DirScatterInodeOp {
     Create = 1,
     Update = 2,
-    Delete = 3,
+    PreDelete = 3,
+    Delete = 4,
     Unkown = 255,
 }
 
@@ -49,7 +50,8 @@ impl DirScatterInodeOp {
         match n {
             1 => Self::Create,
             2 => Self::Update,
-            3 => Self::Delete,
+            3 => Self::PreDelete,
+            4 => Self::Delete,
             _ => Self::Unkown,
         }
     }

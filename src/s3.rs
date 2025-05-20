@@ -142,7 +142,7 @@ impl DirStaging for S3Staging {
                 let body = SdkBody::from(buf);
                 builder.body(body.into())
             },
-            DirScatterInodeOp::Delete => {
+            DirScatterInodeOp::PreDelete | DirScatterInodeOp::Delete => {
                 builder
             },
             _ => {

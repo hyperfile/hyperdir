@@ -243,6 +243,9 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
                 DirScatterInodeOp::Unkown => {
                     warn!("a scatter inode of unkown op: {}", scatter.key);
                 },
+                DirScatterInodeOp::PreDelete => {
+                    warn!("a scatter inode of PreDelete, not yet implemented");
+                },
                 DirScatterInodeOp::Delete => {
                     v_removed.push(scatter);
                 },
