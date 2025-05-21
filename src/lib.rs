@@ -22,6 +22,8 @@ pub trait DirStaging {
     fn to_dir_staging_config(config: &StagingConfig) -> StagingConfig;
     // emit scatter event to dir location based on input file level staging
     async fn emit_scatter_event(&self, buf: &[u8], op: DirScatterInodeOp) -> Result<()>;
+    // get scatter inodes path
+    fn scatter_inodes_path(&self) -> String;
 }
 
 pub mod ondisk;
@@ -30,10 +32,8 @@ pub mod s3;
 pub mod hyper;
 pub mod fs;
 
-pub const DEFAULT_DIR_SUFFIX: &str = "_$folder$";
-pub const DEFAULT_DIR_FILE_FOLDER: &str = "$dirfile$";
-pub const DEFAUTL_DIR_INODE_MARKER: &str = "_$folder$/inode_";
-pub const DEFAULT_DIR_FILE_SUFFIX: &str = "_$folder$/$dirfile$";
+pub const DEFAUTL_DIR_INODE_SCATTER_FOLDER: &str = "!";
+pub const DEFAUTL_DIR_INODE_MARKER: &str = "inode_";
 
 #[derive(Clone, Debug)]
 #[repr(u8)]
@@ -66,11 +66,11 @@ pub struct DirScatterInode {
     pub last_modified: SystemTime,
 }
 
-/// Scatter Inode Format: dir/staging/path[_$folder$]/[inode]_{ulid}_{filename in base64}_{op}_{size}
+/// Scatter Inode Format: dir/staging/dirname/{DEFAUTL_DIR_INODE_SCATTER_FOLDER}/[inode]_{ulid}_{filename in base64}_{op}
 impl DirScatterInode {
     // decode path to dir staging root and file name
     pub fn path_decode(scatter_inode: &str, last_modified: SystemTime) -> Self {
-        let components: Vec<&str> = scatter_inode.split(DEFAULT_DIR_SUFFIX).collect();
+        let components: Vec<&str> = scatter_inode.split(DEFAUTL_DIR_INODE_SCATTER_FOLDER).collect();
         assert!(components.len() == 2);
         assert!(components[1].starts_with("/inode_"));
 
@@ -80,7 +80,7 @@ impl DirScatterInode {
 
         let ulid = Ulid::from_string(parts[1]).expect("failed to decode ulid from event path");
 
-        let alphabet = alphabet::Alphabet::new("*!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789").unwrap();
+        let alphabet = alphabet::Alphabet::new("*-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789").unwrap();
         let crazy_config = engine::GeneralPurposeConfig::new()
             .with_decode_padding_mode(engine::DecodePaddingMode::RequireNone);
         let crazy_engine = engine::GeneralPurpose::new(&alphabet, crazy_config);
@@ -97,13 +97,13 @@ impl DirScatterInode {
         assert!(!dir_staging_path.ends_with("/"));
         let ulid = Ulid::new().to_string();
 
-        let alphabet = alphabet::Alphabet::new("*!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789").unwrap();
+        let alphabet = alphabet::Alphabet::new("*-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789").unwrap();
         let crazy_config = engine::GeneralPurposeConfig::new()
             .with_encode_padding(false);
         let crazy_engine = engine::GeneralPurpose::new(&alphabet, crazy_config);
         let encoded_filename = crazy_engine.encode(filename);
 
-        format!("{dir_staging_path}{DEFAULT_DIR_SUFFIX}/inode_{ulid}_{encoded_filename}_{op}")
+        format!("{dir_staging_path}/{DEFAUTL_DIR_INODE_SCATTER_FOLDER}/inode_{ulid}_{encoded_filename}_{op}")
     }
 
     // input:

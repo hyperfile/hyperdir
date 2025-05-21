@@ -6,14 +6,14 @@ use aws_sdk_s3::primitives::SdkBody;
 use hyperfile::staging::config::StagingConfig;
 use hyperfile::staging::{Staging, s3::S3Staging};
 use super::{DirStaging, DirScatterInode, DirScatterInodeOp};
-use super::{DEFAULT_DIR_SUFFIX, DEFAULT_DIR_FILE_FOLDER, DEFAUTL_DIR_INODE_MARKER, DEFAULT_DIR_FILE_SUFFIX};
+use super::{DEFAUTL_DIR_INODE_MARKER, DEFAUTL_DIR_INODE_SCATTER_FOLDER};
 
 impl DirStaging for S3Staging {
     async fn list_scatter_inodes(&self) -> Result<Vec<DirScatterInode>> {
-        let top_path = self.root_path.strip_suffix(DEFAULT_DIR_FILE_FOLDER).expect("invalid staging root path");
+        let scatter_inodes_path = self.scatter_inodes_path();
         let mut stream = self.client.list_objects_v2()
             .bucket(&self.bucket)
-            .prefix(top_path)
+            .prefix(&scatter_inodes_path)
             .delimiter("/")
             .into_paginator()
             .send();
@@ -102,13 +102,13 @@ impl DirStaging for S3Staging {
     fn to_dir_staging(staging: &S3Staging) -> S3Staging {
         let mut staging = staging.clone();
         let path = std::path::Path::new(&staging.root_path);
-        let top_dir = path.parent()
+        let parent_path = path.parent()
             .expect("invalid top dir, dir staging must have parent")
             .to_str()
             .expect("unable to decode parent to utf8 string")
             .to_owned();
 
-        staging.root_path = format!("{}{}/{}", top_dir, DEFAULT_DIR_SUFFIX, DEFAULT_DIR_FILE_FOLDER);
+        staging.root_path = format!("{}", parent_path);
         staging.root_path_slash = format!("{}/", staging.root_path);
         staging.inode_file = format!("{}/inode", staging.root_path);
         staging
@@ -118,20 +118,14 @@ impl DirStaging for S3Staging {
         let mut config = config.clone();
         assert!(!config.root_uri.ends_with('/'));
 
-        config.root_uri = format!("{}{}/{}", config.root_uri, DEFAULT_DIR_SUFFIX, DEFAULT_DIR_FILE_FOLDER);
+        // no converstion actually
+        config.root_uri = config.root_uri;
         config.inode_file_uri = format!("{}/inode", config.root_uri);
         config
     }
 
     async fn emit_scatter_event(&self, buf: &[u8], op: DirScatterInodeOp) -> Result<()> {
         let (dir, filename) = self.dir_filename();
-        // NOTE: dir staging return filename carry with dir file suffix
-        // trim end suffix if we have
-        let filename = if filename.ends_with(DEFAULT_DIR_FILE_SUFFIX) {
-            filename.trim_end_matches(DEFAULT_DIR_FILE_SUFFIX)
-        } else {
-            filename
-        };
         let key = DirScatterInode::path_encode(dir, filename, op.clone() as u8);
         let builder = self.client
             .put_object()
@@ -158,5 +152,9 @@ impl DirStaging for S3Staging {
             },
         }
         Ok(())
+    }
+
+    fn scatter_inodes_path(&self) -> String {
+        format!("{}/{DEFAUTL_DIR_INODE_SCATTER_FOLDER}/", self.root_path)
     }
 }
