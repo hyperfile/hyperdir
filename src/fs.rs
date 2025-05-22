@@ -116,6 +116,23 @@ impl<'a> HyperDir<'a>
         return Self::stat_fast(client.clone(), file_config).await;
     }
 
+    pub async fn fs_chmod(&mut self, mode: libc::mode_t) -> Result<libc::stat>
+    {
+        debug!("fs_chmod - mode: {:#o}", mode);
+        let mut stat = self.inner.stat();
+        // update permission part only, don't change file type part
+        stat.st_mode = (stat.st_mode & libc::S_IFMT) | (mode & !libc::S_IFMT);
+        self.inner.update_stat(&stat).await
+    }
+
+    pub async fn fs_chown(&mut self, uid: libc::uid_t, gid: libc::gid_t) -> Result<libc::stat> {
+        debug!("fs_chown - uid: {}, gid: {}", uid, gid);
+        let mut stat = self.inner.stat();
+        stat.st_uid = uid;
+        stat.st_gid = gid;
+        self.inner.update_stat(&stat).await
+    }
+
     pub async fn fs_read_entry(&self, hash: &EntryNameHash) -> Result<DirFileEntry>
     {
         debug!("fs_read_entry - ");

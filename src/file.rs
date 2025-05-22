@@ -188,17 +188,21 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         // TODO: set dev and rdev here
         let dev = 0;
         let rdev = 0;
-        let blksize = self.config.meta.data_block_size;
-        self.inode.to_stat(dev, rdev, blksize)
+        self.inode.to_stat(dev, rdev)
     }
 
     // fast stat by read inode without open file
     pub async fn stat_fast(staging: T) -> Result<libc::stat> {
-        let mut raw_inode: InodeRaw = unsafe {
-        std::mem::MaybeUninit::zeroed().assume_init() };
+        let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await?;
         let inode = Inode::from_raw(&raw_inode, None);
-        Ok(inode.to_stat(0, 0, 0))
+        Ok(inode.to_stat(0, 0))
+    }
+
+    pub async fn update_stat(&mut self, stat: &libc::stat) -> Result<libc::stat> {
+        let stat = self.inode.update_stat(stat);
+        let _ = self.flush().await?;
+        Ok(stat)
     }
 
 	pub async fn flush_inode(&mut self, flag: FlushInodeFlag) -> Result<()> {
