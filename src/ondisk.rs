@@ -53,7 +53,7 @@ impl Default for DirFileEntryRaw {
 }
 
 impl DirFileEntryRaw {
-    pub(crate) fn from(inode_raw: &InodeRaw, filename: &[u8]) -> Self {
+    pub fn from(inode_raw: &InodeRaw, filename: &[u8]) -> Self {
         let mut raw: Self = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         raw.inode = *inode_raw;
         if filename.len() > DEFAULT_NAME_LEN + 1 {
@@ -68,7 +68,7 @@ impl DirFileEntryRaw {
         raw
     }
 
-    pub(crate) fn from_slice(buf: &[u8]) -> Self {
+    pub fn from_slice(buf: &[u8]) -> Self {
         let sz = std::mem::size_of::<Self>();
         if sz > buf.len() {
             panic!("invalid size of input, DirFileEntryRaw size {} - buffer size: {}", sz, buf.len());
@@ -79,7 +79,7 @@ impl DirFileEntryRaw {
         raw
     }
 
-    pub(crate) fn as_mut_u8_slice(&mut self) -> &mut [u8] {
+    pub fn as_mut_u8_slice(&mut self) -> &mut [u8] {
         unsafe {
             std::slice::from_raw_parts_mut(
                 (self as *mut Self) as *mut u8,
@@ -88,7 +88,7 @@ impl DirFileEntryRaw {
         }
     }
 
-    pub(crate) fn as_u8_slice(&self) -> &[u8] {
+    pub fn as_u8_slice(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
                 (self as *const Self) as *const u8,
@@ -97,14 +97,14 @@ impl DirFileEntryRaw {
         }
     }
 
-    pub(crate) fn dummy_value() -> Self {
+    pub fn dummy_value() -> Self {
         Self {
             inode: InodeRaw::default(),
             name: DUMMY_FILENAME,
         }
     }
 
-    pub(crate) fn is_dummy(&self) -> bool {
+    pub fn is_dummy(&self) -> bool {
         &self.name == &DUMMY_FILENAME
     }
 }

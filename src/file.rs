@@ -21,7 +21,7 @@ use hyperfile::ondisk::{BMapRawType, InodeRaw};
 use super::ondisk::{DirFileEntryRaw, DEFAULT_NAME_LEN};
 use super::{DirStaging, DirScatterInode, DirScatterInodeOp};
 
-const DIR_FILE_ENTRY_RAW_SIZE: usize = std::mem::size_of::<DirFileEntryRaw>();
+pub const DIR_FILE_ENTRY_RAW_SIZE: usize = std::mem::size_of::<DirFileEntryRaw>();
 
 #[derive(Debug)]
 pub struct DirFileEntry {
