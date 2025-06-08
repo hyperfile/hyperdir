@@ -225,6 +225,10 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         self.staging.interceptor(i);
     }
 
+    pub fn flags(&self) -> & HyperFileFlags {
+        &self.flags
+    }
+
     pub async fn read_entry(&self, hash: &EntryNameHash) -> Result<DirFileEntry> {
         let entry_raw = self.bmap.lookup(hash).await?;
         Ok(DirFileEntry::from_raw(&entry_raw))
