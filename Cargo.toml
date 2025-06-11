@@ -12,7 +12,7 @@ ulid = "1.2.1"
 base64 = "0.22.1"
 crc64fast = "1.1.0"
 aws-sdk-s3 = "1.85.0"
-btree-ondisk = { version = "0.14.0", path = "../btree-ondisk" }
+btree-ondisk = { version = "0.14.0", path = "../btree-ondisk", default-features = false }
 hyperfile = { version = "0.1.0", path = "../hyperfile-staging", default-features = false }
 
 [features]
