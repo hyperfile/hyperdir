@@ -133,6 +133,21 @@ impl<'a> HyperDir<'a>
         self.inner.update_stat(&stat).await
     }
 
+    pub async fn fs_setattr(&mut self, stat: &libc::stat) -> Result<libc::stat> {
+        debug!("fs_setattr - mode: {}, uid: {}, gid: {}", stat.st_mode, stat.st_uid, stat.st_gid);
+        self.inner.update_stat(stat).await
+    }
+
+    pub async fn fs_setattr_fast(client: &Client, uri: &str, stat: &libc::stat) -> Result<libc::stat>
+    {
+        debug!("fs_setattr_fast - uri: {}", uri);
+        let staging_config = StagingConfig::new_s3_uri(uri, None);
+        let file_config = HyperFileConfigBuilder::new()
+                            .with_staging_config(&staging_config)
+                            .build();
+        return Self::update_stat_fast(client.clone(), file_config, &stat).await;
+    }
+
     pub async fn fs_read_entry(&self, hash: &EntryNameHash) -> Result<DirFileEntry>
     {
         debug!("fs_read_entry - ");

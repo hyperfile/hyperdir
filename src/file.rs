@@ -199,6 +199,18 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         Ok(inode.to_stat(0, 0))
     }
 
+    // fast update stat by load inode and flush inode
+    pub async fn update_stat_fast(staging: T, stat: &libc::stat) -> Result<libc::stat> {
+        let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        let od_state = staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await?;
+        let mut inode = Inode::from_raw(&raw_inode, od_state);
+        inode.update_stat(stat);
+        let raw = inode.to_raw(raw_inode.i_bmap);
+        let od_state = inode.get_ondisk_state();
+        let _ = staging.flush_inode(raw.as_u8_slice(), od_state, FlushInodeFlag::Update).await?;
+        Ok(inode.to_stat(stat.st_dev, stat.st_rdev))
+    }
+
     pub async fn update_stat(&mut self, stat: &libc::stat) -> Result<libc::stat> {
         let stat = self.inode.update_stat(stat);
         let _ = self.flush().await?;
