@@ -8,6 +8,7 @@ use log::warn;
 use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 use btree_ondisk::{BlockLoader, bmap::BMap, NodeValue};
 use btree_ondisk::btree::BtreeNodeDirty;
+use btree_ondisk::DEFAULT_CACHE_UNLIMITED;
 use hyperfile::file::{HyperTrait, DirtyDataBlocks};
 use hyperfile::{BlockIndex, BlockPtr, SegmentId, SegmentOffset, BMapUserData};
 use hyperfile::meta_format::BlockPtrFormat;
@@ -72,7 +73,7 @@ impl NodeValue for DirFileEntryRaw {
     }
 }
 
-pub struct HyperDirFile<'a, T, L: BlockLoader<BlockPtr>> {
+pub struct HyperDirFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>> {
     bmap: BMap<'a, BlockIndex, DirFileEntryRaw, BlockPtr, L>,
     staging: T,
     bmap_ud: BMapUserData,
@@ -85,7 +86,7 @@ pub struct HyperDirFile<'a, T, L: BlockLoader<BlockPtr>> {
 
 impl<'a, T, L> HyperDirFile<'a, T, L>
     where
-        T: Staging<T, L> + SegmentReadWrite + DirStaging,
+        T: Staging<L> + SegmentReadWrite + DirStaging + Send + Clone + 'static,
         L: BlockLoader<BlockPtr> + Clone,
 {
     pub async fn new(staging: T, meta_block_loader: L, config: HyperFileConfig, flags: HyperFileFlags, mode: HyperFileMode) -> Result<Self>
@@ -368,7 +369,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
 
 impl<'a, T, L> HyperTrait<T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
     where
-        T: Staging<T, L> + SegmentReadWrite,
+        T: Staging<L> + SegmentReadWrite + Send + Clone + 'static,
         L: BlockLoader<BlockPtr> + Clone,
 {
 	fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr {
@@ -396,6 +397,14 @@ impl<'a, T, L> HyperTrait<T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
     }
 
     fn clear_data_blocks_cache(&mut self) {
+        // do nothing
+    }
+
+    fn set_data_blocks_cache_unlimited(&mut self) {
+        // do nothing
+    }
+
+    fn restore_data_blocks_cache_limit(&mut self) {
         // do nothing
     }
 
@@ -451,6 +460,16 @@ impl<'a, T, L> HyperTrait<T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
 
     async fn bmap_insert_dummy_value(bmap: &mut BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L>, blk_idx: &BlockIndex) -> Result<Option<DirFileEntryRaw>> {
         bmap.insert(*blk_idx, DirFileEntryRaw::dummy_value()).await
+    }
+
+    fn bmap_set_cache_unlimited(&self) -> usize {
+        let limit = self.bmap.get_cache_limit();
+        self.bmap.set_cache_limit(DEFAULT_CACHE_UNLIMITED);
+        limit
+    }
+
+    fn bmap_set_cache_limit(&self, limit: usize) {
+        self.bmap.set_cache_limit(limit);
     }
 
     fn inode(&self) -> &Inode {
