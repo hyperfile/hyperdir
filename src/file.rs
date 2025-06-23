@@ -5,7 +5,10 @@ use std::ffi::OsStr;
 use std::ffi::CStr;
 use std::collections::{HashMap, BTreeMap};
 use log::warn;
-use tokio::sync::{Semaphore, OwnedSemaphorePermit};
+use tokio::sync::{
+    Semaphore, OwnedSemaphorePermit,
+    Mutex, OwnedMutexGuard,
+};
 use btree_ondisk::{BlockLoader, bmap::BMap, NodeValue};
 use btree_ondisk::btree::BtreeNodeDirty;
 use btree_ondisk::DEFAULT_CACHE_UNLIMITED;
@@ -81,6 +84,7 @@ pub struct HyperDirFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>> {
 	flags: HyperFileFlags,
     last_flush: Instant,
     sema: Arc<Semaphore>,
+    flush_lock: Arc<Mutex<()>>,
     inode: Inode,
 }
 
@@ -109,6 +113,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             flags: flags,
             last_flush: Instant::now(),
             sema: Arc::new(Semaphore::new(1)),
+            flush_lock: Arc::new(Mutex::new(())),
             inode: inode,
         };
         // flush inode for hyper file new created
@@ -174,6 +179,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             flags: flags,
             last_flush: Instant::now(),
             sema: Arc::new(Semaphore::new(permits)),
+            flush_lock: Arc::new(Mutex::new(())),
             inode: Inode::from_raw(&raw_inode, inode_state),
         };
 		// refresh bmap if need to do recovery
@@ -422,6 +428,14 @@ impl<'a, T, L> HyperTrait<T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
 
     fn unlock(&self, permit: OwnedSemaphorePermit) {
         drop(permit);
+    }
+
+    async fn flush_lock(&self) -> OwnedMutexGuard<()> {
+        self.flush_lock.clone().lock_owned().await
+    }
+
+    fn flush_unlock(&self, lock: OwnedMutexGuard<()>) {
+        drop(lock);
     }
 
     fn bmap_as_slice(&self) -> &[u8] {
