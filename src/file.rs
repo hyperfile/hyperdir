@@ -1,6 +1,10 @@
 use std::io::{Result, Error, ErrorKind};
 use std::time::{Instant, Duration};
 use std::sync::Arc;
+#[cfg(feature = "wal")]
+use std::sync::Weak;
+#[cfg(feature = "wal")]
+use std::pin::Pin;
 use std::ffi::OsStr;
 use std::ffi::CStr;
 use std::collections::{HashMap, BTreeMap};
@@ -511,5 +515,15 @@ impl<'a, T, L> HyperTrait<T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
 
     async fn sleep(dur: Duration) {
         tokio::time::sleep(dur).await;
+    }
+
+    #[cfg(feature = "wal")]
+    async fn wal_set_mem_segment(&self, _mem_segid: SegmentId, _mem_segdata: Weak<Pin<Box<Vec<u8>>>>) {
+        todo!();
+    }
+
+    #[cfg(feature = "wal")]
+    async fn wal_clear_mem_segment(&self, _mem_segid: SegmentId) {
+        todo!();
     }
 }

@@ -17,3 +17,4 @@ hyperfile = { version = "0.1.0", path = "../hyperfile-staging", default-features
 
 [features]
 default = ["hyperfile/blocking", "hyperfile/meta_loader_batch"]
+wal = ["hyperfile/wal"]
