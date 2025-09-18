@@ -13,7 +13,7 @@ use tokio::sync::{
     Semaphore, OwnedSemaphorePermit,
     Mutex, OwnedMutexGuard,
 };
-use btree_ondisk::{BlockLoader, bmap::BMap, NodeValue};
+use btree_ondisk::{BlockLoader, bmap::BMap, NodeValue, NullNodeCache};
 use btree_ondisk::btree::BtreeNodeDirty;
 use btree_ondisk::DEFAULT_CACHE_UNLIMITED;
 use hyperfile::file::{HyperTrait, DirtyDataBlocks};
@@ -81,7 +81,7 @@ impl NodeValue for DirFileEntryRaw {
 }
 
 pub struct HyperDirFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>> {
-    bmap: BMap<'a, BlockIndex, DirFileEntryRaw, BlockPtr, L>,
+    bmap: BMap<'a, BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>,
     staging: T,
     bmap_ud: BMapUserData,
     config: HyperFileConfig,
@@ -101,7 +101,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     {
         let meta_config = config.meta.clone();
 
-        let bmap = BMap::<BlockIndex, DirFileEntryRaw, BlockPtr, L>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader);
+        let bmap = BMap::<BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader, NullNodeCache);
 
         let inode = Inode::default_dir()
             .with_mode(&mode)
@@ -163,7 +163,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         // get back meta config from inode raw
         let meta_config = HyperFileMetaConfig::from_u32(raw_inode.i_meta_config);
         let b = raw_inode.i_bmap;
-        let bmap = BMap::<BlockIndex, DirFileEntryRaw, BlockPtr, L>::read(&b, meta_config.meta_block_size, meta_block_loader);
+        let bmap = BMap::<BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>::read(&b, meta_config.meta_block_size, meta_block_loader, NullNodeCache);
         let bmap_ud = BMapUserData::from_u32(bmap.get_userdata());
 
         let permits = if flags.is_rdonly() {
@@ -377,7 +377,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     }
 }
 
-impl<'a, T, L> HyperTrait<T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
+impl<'a, T, L> HyperTrait<T, L, NullNodeCache, DirFileEntryRaw> for HyperDirFile<'a, T, L>
     where
         T: Staging<L> + SegmentReadWrite + Send + Clone + 'static,
         L: BlockLoader<BlockPtr> + Clone,
@@ -450,6 +450,10 @@ impl<'a, T, L> HyperTrait<T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
         self.bmap.get_block_loader()
     }
 
+    fn bmap_get_node_cache(&self) -> NullNodeCache {
+        NullNodeCache
+    }
+
     fn bmap_dirty(&self) -> bool {
         self.bmap.dirty()
     }
@@ -470,13 +474,13 @@ impl<'a, T, L> HyperTrait<T, L, DirFileEntryRaw> for HyperDirFile<'a, T, L>
         self.bmap.clear_dirty()
     }
 
-    fn bmap_update(&mut self, bmap: BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L>) {
+    fn bmap_update(&mut self, bmap: BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>) {
         *&mut self.bmap = unsafe {
-            std::mem::transmute::<BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L>, BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L>>(bmap)
+            std::mem::transmute::<BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>, BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>>(bmap)
         };
     }
 
-    async fn bmap_insert_dummy_value(bmap: &mut BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L>, blk_idx: &BlockIndex) -> Result<Option<DirFileEntryRaw>> {
+    async fn bmap_insert_dummy_value(bmap: &mut BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>, blk_idx: &BlockIndex) -> Result<Option<DirFileEntryRaw>> {
         bmap.insert(*blk_idx, DirFileEntryRaw::dummy_value()).await
     }
 
