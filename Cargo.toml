@@ -2,6 +2,13 @@
 name = "hyperdir"
 version = "0.1.0"
 edition = "2021"
+description = "A container for inodes implemented as a Hyperfile"
+authors = ["Dai Yiyang"]
+license = "Apache-2.0"
+categories = ["asynchronous", "filesystem", "data-structures"]
+keywords = ["file", "object-storage", "s3"]
+homepage = "https://github.com/hyperfile/hyperdir"
+repository = "https://github.com/hyperfile/hyperdir"
 
 [dependencies]
 log = "0.4.25"
