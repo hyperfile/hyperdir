@@ -57,7 +57,7 @@ impl DirStaging for S3Staging {
             	Err(sdk_err) => {
             	    let err_str = format!("GetObject s3://{}/{} error: {}", self.bucket, key, sdk_err);
             	    error!("{}", err_str);
-            	    return Err(Error::new(ErrorKind::Other, err_str));
+            	    return Err(Error::other(err_str));
             	},
         	}
         }
@@ -66,8 +66,8 @@ impl DirStaging for S3Staging {
 
     async fn remove_scatter_inodes(&self, delete_keys: Vec<String>) -> Result<()> {
         let mut err = false;
-        for keys in delete_keys.chunks(1000).into_iter() {
-            let obj_ids = keys.into_iter().map(|k| {
+        for keys in delete_keys.chunks(1000) {
+            let obj_ids = keys.iter().map(|k| {
                     // FIXME: move the value, avoid ref
                     aws_sdk_s3::types::ObjectIdentifier::builder()
                         .key(k.to_string())
@@ -108,7 +108,7 @@ impl DirStaging for S3Staging {
             .expect("unable to decode parent to utf8 string")
             .to_owned();
 
-        staging.root_path = format!("{}", parent_path);
+        staging.root_path = parent_path.to_string();
         staging.root_path_slash = format!("{}/", staging.root_path);
         staging.inode_file = format!("{}/inode", staging.root_path);
         staging
@@ -118,8 +118,6 @@ impl DirStaging for S3Staging {
         let mut config = config.clone();
         assert!(!config.root_uri.ends_with('/'));
 
-        // no converstion actually
-        config.root_uri = config.root_uri;
         config.inode_file_uri = format!("{}/inode", config.root_uri);
         config
     }
@@ -148,7 +146,7 @@ impl DirStaging for S3Staging {
             Err(sdk_err) => {
                 let err_str = format!("PutObject s3://{}/{} error: {}", self.bucket, key, sdk_err);
                 error!("{}", err_str);
-                return Err(Error::new(ErrorKind::Other, err_str));
+                return Err(Error::other(err_str));
             },
         }
         Ok(())

@@ -111,19 +111,19 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         bmap.set_userdata(bmap_ud.as_u32());
 
 		let mut file = Self {
-            bmap: bmap,
-            staging: staging,
-            bmap_ud: bmap_ud,
-            config: config,
-            flags: flags,
+            bmap,
+            staging,
+            bmap_ud,
+            config,
+            flags,
             last_flush: Instant::now(),
             sema: Arc::new(Semaphore::new(1)),
             flush_lock: Arc::new(Mutex::new(())),
-            inode: inode,
+            inode,
             flush_timing: FlushTiming::default(),
         };
         // flush inode for hyper file new created
-        let _ = file.flush_inode(FlushInodeFlag::Create).await?;
+        file.flush_inode(FlushInodeFlag::Create).await?;
         Ok(file)
     }
 
@@ -147,21 +147,20 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     async fn do_open(staging: T, meta_block_loader: L, mut config: HyperFileConfig, flags: HyperFileFlags, cno: u64) -> Result<Self>
     {
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-        let inode_state;
         let res_inode = if cno == 0 {
-            staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await
+            staging.load_inode(raw_inode.as_mut_u8_slice()).await
         } else {
-            staging.load_inode_from_segment(&mut raw_inode.as_mut_u8_slice(), cno as SegmentId).await
+            staging.load_inode_from_segment(raw_inode.as_mut_u8_slice(), cno as SegmentId).await
         };
-        match res_inode {
+        let inode_state = match res_inode {
             Ok(od_state) => {
                 /* if we load inode without error, we use inode as truth of metadata */
-                inode_state = od_state;
+                od_state
             },
             Err(e) => {
                 return Err(e);
             },
-        }
+        };
         // get back meta config from inode raw
         let meta_config = HyperFileMetaConfig::from_u32(raw_inode.i_meta_config);
         let b = raw_inode.i_bmap;
@@ -178,11 +177,11 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
 		config.meta = meta_config;
 
 		let mut file = Self {
-            bmap: bmap,
-            staging: staging,
-            bmap_ud: bmap_ud,
-            config: config,
-            flags: flags,
+            bmap,
+            staging,
+            bmap_ud,
+            config,
+            flags,
             last_flush: Instant::now(),
             sema: Arc::new(Semaphore::new(permits)),
             flush_lock: Arc::new(Mutex::new(())),
@@ -208,7 +207,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     // fast stat by read inode without open file
     pub async fn stat_fast(staging: T) -> Result<libc::stat> {
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-        staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await?;
+        staging.load_inode(raw_inode.as_mut_u8_slice()).await?;
         let inode = Inode::from_raw(&raw_inode, None);
         Ok(inode.to_stat(0, 0))
     }
@@ -216,7 +215,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     // fast update stat by load inode and flush inode
     pub async fn update_stat_fast(staging: T, stat: &libc::stat) -> Result<libc::stat> {
         let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-        let od_state = staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await?;
+        let od_state = staging.load_inode(raw_inode.as_mut_u8_slice()).await?;
         let mut inode = Inode::from_raw(&raw_inode, od_state);
         inode.update_stat(stat);
         let raw = inode.to_raw(raw_inode.i_bmap);
@@ -349,7 +348,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             while n <= last_key {
                 let key = self.bmap.seek_key(&n).await?;
                 let val = self.bmap.lookup(&key.clone()).await?;
-                map.insert(key.clone(), val);
+                map.insert(key, val);
                 if key > n {
                     // n not found in bmap, reset n with key for next
                     n = key;
@@ -373,8 +372,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         self.staging.remove_scatter_inodes(v_all_scatters_key).await?;
 
         // #9. build result
-        let v: Vec<DirFileEntry> = last_view_map.into_iter()
-                .map(|(_, raw)| DirFileEntry::from_raw(&raw))
+        let v: Vec<DirFileEntry> = last_view_map.into_values().map(|raw| DirFileEntry::from_raw(&raw))
                 .collect();
         Ok(v)
     }
@@ -395,17 +393,17 @@ impl<'a, T, L> HyperTrait<T, L, NullNodeCache, DirFileEntryRaw> for HyperDirFile
 
     fn blk_ptr_decode_display(&self, blk_ptr: &BlockPtr) -> String {
         if BlockPtrFormat::is_dummy_value(blk_ptr) {
-            return format!("[Dummy]");
+            "[Dummy]".to_string()
         } else if BlockPtrFormat::is_invalid_value(blk_ptr) {
-            return format!("[Invalid]");
+            "[Invalid]".to_string()
         } else if BlockPtrFormat::is_zero_block(blk_ptr) {
-            return format!("[Zero Block]");
+            "[Zero Block]".to_string()
         } else if BlockPtrFormat::is_on_staging(blk_ptr) {
             let (id, off) = self.blk_ptr_decode(blk_ptr);
             let group_id = BlockPtrFormat::decode_micro_group_id(blk_ptr);
-            return format!("[Staging: id {} - offset {} - group {}]", id, off, group_id);
+            format!("[Staging: id {} - offset {} - group {}]", id, off, group_id)
         } else {
-            return format!("[Unkown: 0x{:x}]", blk_ptr);
+            format!("[Unkown: 0x{:x}]", blk_ptr)
         }
     }
 
@@ -478,7 +476,7 @@ impl<'a, T, L> HyperTrait<T, L, NullNodeCache, DirFileEntryRaw> for HyperDirFile
     }
 
     fn bmap_update(&mut self, bmap: BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>) {
-        *&mut self.bmap = unsafe {
+        self.bmap = unsafe {
             std::mem::transmute::<BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>, BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>>(bmap)
         };
     }
