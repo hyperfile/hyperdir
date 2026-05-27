@@ -16,7 +16,7 @@ use tokio::sync::{
 use btree_ondisk::{BlockLoader, bmap::BMap, NodeValue, NullNodeCache};
 use btree_ondisk::btree::BtreeNodeDirty;
 use btree_ondisk::DEFAULT_CACHE_UNLIMITED;
-use hyperfile::file::{HyperTrait, DirtyDataBlocks};
+use hyperfile::file::{HyperTrait, DirtyDataBlocks, FlushTiming};
 use hyperfile::{BlockIndex, BlockPtr, SegmentId, SegmentOffset, BMapUserData};
 use hyperfile::meta_format::BlockPtrFormat;
 use hyperfile::inode::{Inode, FlushInodeFlag};
@@ -90,6 +90,7 @@ pub struct HyperDirFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>> {
     sema: Arc<Semaphore>,
     flush_lock: Arc<Mutex<()>>,
     inode: Inode,
+    flush_timing: FlushTiming,
 }
 
 impl<'a, T, L> HyperDirFile<'a, T, L>
@@ -101,7 +102,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     {
         let meta_config = config.meta.clone();
 
-        let bmap = BMap::<BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader, NullNodeCache);
+        let bmap = BMap::<BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>::new(meta_config.root_size, meta_config.meta_block_size, meta_block_loader, NullNodeCache)?;
 
         let inode = Inode::default_dir()
             .with_mode(&mode)
@@ -119,6 +120,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             sema: Arc::new(Semaphore::new(1)),
             flush_lock: Arc::new(Mutex::new(())),
             inode: inode,
+            flush_timing: FlushTiming::default(),
         };
         // flush inode for hyper file new created
         let _ = file.flush_inode(FlushInodeFlag::Create).await?;
@@ -163,7 +165,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         // get back meta config from inode raw
         let meta_config = HyperFileMetaConfig::from_u32(raw_inode.i_meta_config);
         let b = raw_inode.i_bmap;
-        let bmap = BMap::<BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>::read(&b, meta_config.meta_block_size, meta_block_loader, NullNodeCache);
+        let bmap = BMap::<BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>::read(&b, meta_config.meta_block_size, meta_block_loader, NullNodeCache)?;
         let bmap_ud = BMapUserData::from_u32(bmap.get_userdata());
 
         let permits = if flags.is_rdonly() {
@@ -185,6 +187,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             sema: Arc::new(Semaphore::new(permits)),
             flush_lock: Arc::new(Mutex::new(())),
             inode: Inode::from_raw(&raw_inode, inode_state),
+            flush_timing: FlushTiming::default(),
         };
 		// refresh bmap if need to do recovery
 		let _ = file.refresh_bmap().await?;
@@ -521,6 +524,10 @@ impl<'a, T, L> HyperTrait<T, L, NullNodeCache, DirFileEntryRaw> for HyperDirFile
         tokio::time::sleep(dur).await;
     }
 
+    fn flush_timing(&self) -> &FlushTiming {
+        &self.flush_timing
+    }
+
     #[cfg(feature = "wal")]
     async fn wal_set_mem_segment(&self, _mem_segid: SegmentId, _mem_segdata: Weak<Pin<Box<Vec<u8>>>>) {
         todo!();
@@ -528,6 +535,11 @@ impl<'a, T, L> HyperTrait<T, L, NullNodeCache, DirFileEntryRaw> for HyperDirFile
 
     #[cfg(feature = "wal")]
     async fn wal_clear_mem_segment(&self, _mem_segid: SegmentId) {
+        todo!();
+    }
+
+    #[cfg(feature = "wal")]
+    fn wal_spawn_delete_segment(&self, _segid: SegmentId) {
         todo!();
     }
 }
