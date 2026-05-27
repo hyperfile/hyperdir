@@ -12,7 +12,7 @@ repository = "https://github.com/hyperfile/hyperdir"
 
 [dependencies]
 log = "0.4.25"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["sync", "time"] }
 libc = "0.2.170"
 bytes = "1.10.1"
 ulid = "1.2.1"

@@ -32,8 +32,8 @@ pub mod s3;
 pub mod hyper;
 pub mod fs;
 
-pub const DEFAUTL_DIR_INODE_SCATTER_FOLDER: &str = "!";
-pub const DEFAUTL_DIR_INODE_MARKER: &str = "inode_";
+pub const DEFAULT_DIR_INODE_SCATTER_FOLDER: &str = "!";
+pub const DEFAULT_DIR_INODE_MARKER: &str = "inode_";
 
 #[derive(Clone, Debug)]
 #[repr(u8)]
@@ -42,7 +42,7 @@ pub enum DirScatterInodeOp {
     Update = 2,
     PreDelete = 3,
     Delete = 4,
-    Unkown = 255,
+    Unknown = 255,
 }
 
 impl DirScatterInodeOp {
@@ -52,7 +52,7 @@ impl DirScatterInodeOp {
             2 => Self::Update,
             3 => Self::PreDelete,
             4 => Self::Delete,
-            _ => Self::Unkown,
+            _ => Self::Unknown,
         }
     }
 }
@@ -66,11 +66,11 @@ pub struct DirScatterInode {
     pub last_modified: SystemTime,
 }
 
-/// Scatter Inode Format: dir/staging/dirname/{DEFAUTL_DIR_INODE_SCATTER_FOLDER}/[inode]_{ulid}_{filename in base64}_{op}
+/// Scatter Inode Format: dir/staging/dirname/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/[inode]_{ulid}_{filename in base64}_{op}
 impl DirScatterInode {
     // decode path to dir staging root and file name
     pub fn path_decode(scatter_inode: &str, last_modified: SystemTime) -> Self {
-        let components: Vec<&str> = scatter_inode.split(DEFAUTL_DIR_INODE_SCATTER_FOLDER).collect();
+        let components: Vec<&str> = scatter_inode.split(DEFAULT_DIR_INODE_SCATTER_FOLDER).collect();
         assert!(components.len() == 2);
         assert!(components[1].starts_with("/inode_"));
 
@@ -103,7 +103,7 @@ impl DirScatterInode {
         let crazy_engine = engine::GeneralPurpose::new(&alphabet, crazy_config);
         let encoded_filename = crazy_engine.encode(filename);
 
-        format!("{dir_staging_path}/{DEFAUTL_DIR_INODE_SCATTER_FOLDER}/inode_{ulid}_{encoded_filename}_{op}")
+        format!("{dir_staging_path}/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/inode_{ulid}_{encoded_filename}_{op}")
     }
 
     // input:

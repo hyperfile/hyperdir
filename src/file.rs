@@ -85,7 +85,7 @@ pub struct HyperDirFile<'a, T: Send + Clone, L: BlockLoader<BlockPtr>> {
     staging: T,
     bmap_ud: BMapUserData,
     config: HyperFileConfig,
-	flags: HyperFileFlags,
+    flags: HyperFileFlags,
     last_flush: Instant,
     sema: Arc<Semaphore>,
     flush_lock: Arc<Mutex<()>>,
@@ -110,7 +110,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         let bmap_ud = BMapUserData::new(BlockPtrFormat::Flat);
         bmap.set_userdata(bmap_ud.as_u32());
 
-		let mut file = Self {
+        let mut file = Self {
             bmap,
             staging,
             bmap_ud,
@@ -173,10 +173,10 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             1
         };
 
-		// overwrite the default meta config with the one we get from inode
-		config.meta = meta_config;
+        // overwrite the default meta config with the one we get from inode
+        config.meta = meta_config;
 
-		let mut file = Self {
+        let mut file = Self {
             bmap,
             staging,
             bmap_ud,
@@ -188,8 +188,8 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             inode: Inode::from_raw(&raw_inode, inode_state),
             flush_timing: FlushTiming::default(),
         };
-		// refresh bmap if need to do recovery
-		let _ = file.refresh_bmap().await?;
+        // refresh bmap if need to do recovery
+        let _ = file.refresh_bmap().await?;
         Ok(file)
     }
 
@@ -230,17 +230,17 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         Ok(stat)
     }
 
-	pub async fn flush_inode(&mut self, flag: FlushInodeFlag) -> Result<()> {
-		// TODO update necessary inode fields
-		let mut b: BMapRawType = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-		b.copy_from_slice(self.bmap.as_slice());
-		let raw_inode = self.inode.to_raw(b);
-		let od_state = self.staging.flush_inode(raw_inode.as_u8_slice(), self.inode.get_ondisk_state(), flag).await?;
-		self.inode.clear_attr_dirty();
-		self.inode.set_ondisk_state(od_state);
-		self.inode.set_last_ondisk_cno(self.inode.get_last_cno());
-		Ok(())
-	}
+    pub async fn flush_inode(&mut self, flag: FlushInodeFlag) -> Result<()> {
+        // TODO update necessary inode fields
+        let mut b: BMapRawType = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        b.copy_from_slice(self.bmap.as_slice());
+        let raw_inode = self.inode.to_raw(b);
+        let od_state = self.staging.flush_inode(raw_inode.as_u8_slice(), self.inode.get_ondisk_state(), flag).await?;
+        self.inode.clear_attr_dirty();
+        self.inode.set_ondisk_state(od_state);
+        self.inode.set_last_ondisk_cno(self.inode.get_last_cno());
+        Ok(())
+    }
 
     pub fn staging_config(&self) -> &StagingConfig {
         &self.config.staging
@@ -273,8 +273,8 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         let mut v_fetch = Vec::new();
         for scatter in v_last_view.into_iter() {
             match scatter.op {
-                DirScatterInodeOp::Unkown => {
-                    warn!("a scatter inode of unkown op: {}", scatter.key);
+                DirScatterInodeOp::Unknown => {
+                    warn!("a scatter inode of unknown op: {}", scatter.key);
                 },
                 DirScatterInodeOp::PreDelete => {
                     warn!("a scatter inode of PreDelete, not yet implemented");
@@ -383,13 +383,13 @@ impl<'a, T, L> HyperTrait<T, L, NullNodeCache, DirFileEntryRaw> for HyperDirFile
         T: Staging<L> + SegmentReadWrite + Send + Clone + 'static,
         L: BlockLoader<BlockPtr> + Clone,
 {
-	fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr {
+    fn blk_ptr_encode(&self, segid: SegmentId, offset: SegmentOffset, seq: usize) -> BlockPtr {
         BlockPtrFormat::encode(segid, offset, seq, &self.bmap_ud.blk_ptr_format)
-	}
+    }
 
-	fn blk_ptr_decode(&self, blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset) {
+    fn blk_ptr_decode(&self, blk_ptr: &BlockPtr) -> (SegmentId, SegmentOffset) {
         BlockPtrFormat::decode(blk_ptr, &self.bmap_ud.blk_ptr_format)
-	}
+    }
 
     fn blk_ptr_decode_display(&self, blk_ptr: &BlockPtr) -> String {
         if BlockPtrFormat::is_dummy_value(blk_ptr) {
@@ -403,7 +403,7 @@ impl<'a, T, L> HyperTrait<T, L, NullNodeCache, DirFileEntryRaw> for HyperDirFile
             let group_id = BlockPtrFormat::decode_micro_group_id(blk_ptr);
             format!("[Staging: id {} - offset {} - group {}]", id, off, group_id)
         } else {
-            format!("[Unkown: 0x{:x}]", blk_ptr)
+            format!("[Unknown: 0x{:x}]", blk_ptr)
         }
     }
 
