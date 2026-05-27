@@ -6,7 +6,7 @@ use aws_sdk_s3::primitives::SdkBody;
 use hyperfile::staging::config::StagingConfig;
 use hyperfile::staging::{Staging, s3::S3Staging};
 use super::{DirStaging, DirScatterInode, DirScatterInodeOp};
-use super::{DEFAUTL_DIR_INODE_MARKER, DEFAUTL_DIR_INODE_SCATTER_FOLDER};
+use super::{DEFAULT_DIR_INODE_MARKER, DEFAULT_DIR_INODE_SCATTER_FOLDER};
 
 impl DirStaging for S3Staging {
     async fn list_scatter_inodes(&self) -> Result<Vec<DirScatterInode>> {
@@ -24,7 +24,7 @@ impl DirStaging for S3Staging {
                 if let Some(objects) = list_res.contents {
                     for obj in objects.iter() {
                         if let Some(key) = obj.key() {
-                            if key.contains(DEFAUTL_DIR_INODE_MARKER) {
+                            if key.contains(DEFAULT_DIR_INODE_MARKER) {
                                 let st = SystemTime::try_from(
                                     obj.last_modified.expect("unable to get last_modified from object")
                                 ).expect("unable to convert DateTime to SystemTime");
@@ -138,7 +138,7 @@ impl DirStaging for S3Staging {
                 builder
             },
             _ => {
-                panic!("unkown DirScatterInodeOp {:?}", op);
+                panic!("unknown DirScatterInodeOp {:?}", op);
             },
         };
         match builder.send().await {
@@ -153,6 +153,6 @@ impl DirStaging for S3Staging {
     }
 
     fn scatter_inodes_path(&self) -> String {
-        format!("{}/{DEFAUTL_DIR_INODE_SCATTER_FOLDER}/", self.root_path)
+        format!("{}/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/", self.root_path)
     }
 }
