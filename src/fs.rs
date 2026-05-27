@@ -145,7 +145,7 @@ impl<'a> HyperDir<'a>
         let file_config = HyperFileConfigBuilder::new()
                             .with_staging_config(&staging_config)
                             .build();
-        return Self::update_stat_fast(client.clone(), file_config, &stat).await;
+        return Self::update_stat_fast(client.clone(), file_config, stat).await;
     }
 
     pub async fn fs_read_entry(&self, hash: &EntryNameHash) -> Result<DirFileEntry>

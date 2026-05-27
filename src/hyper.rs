@@ -17,13 +17,13 @@ impl<'a> HyperDir<'a> {
     {
         match Self::open(client.clone(), file_config.clone(), flags.clone()).await {
             Ok(hyper) => {
-                return Ok(hyper);
+                Ok(hyper)
             },
             Err(e) => {
                 if create && e.kind() == ErrorKind::NotFound {
                     return Self::create(client, file_config, flags, mode).await;
                 }
-                return Err(e);
+                Err(e)
             }
         }
     }

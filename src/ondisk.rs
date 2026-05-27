@@ -105,6 +105,6 @@ impl DirFileEntryRaw {
     }
 
     pub fn is_dummy(&self) -> bool {
-        &self.name == &DUMMY_FILENAME
+        self.name == DUMMY_FILENAME
     }
 }
