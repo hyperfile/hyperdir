@@ -56,14 +56,19 @@ impl DirFileEntryRaw {
     pub fn from(inode_raw: &InodeRaw, filename: &[u8]) -> Self {
         let mut raw: Self = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         raw.inode = *inode_raw;
-        if filename.len() > DEFAULT_NAME_LEN + 1 {
-            raw.name.copy_from_slice(&filename[0..DEFAULT_NAME_LEN]);
-            warn!("filename {} too long, trimed to {}",
-                std::str::from_utf8(filename).unwrap(),
-                std::str::from_utf8(&raw.name).unwrap());
+        // raw.name is DEFAULT_NAME_LEN + 1 bytes; the last byte is reserved for
+        // the trailing NUL so DirFileEntry::from_raw can parse with CStr.
+        // Hence the maximum usable filename byte length is DEFAULT_NAME_LEN.
+        if filename.len() > DEFAULT_NAME_LEN {
+            raw.name[..DEFAULT_NAME_LEN].copy_from_slice(&filename[..DEFAULT_NAME_LEN]);
+            raw.name[DEFAULT_NAME_LEN] = 0;
+            warn!("filename {} too long, trimmed to {} bytes",
+                String::from_utf8_lossy(filename),
+                DEFAULT_NAME_LEN);
         } else {
-            let dest = &mut raw.name[0..filename.len()];
-            dest.copy_from_slice(filename);
+            raw.name[..filename.len()].copy_from_slice(filename);
+            // remaining bytes including the trailing NUL are already zero
+            // from MaybeUninit::zeroed above
         };
         raw
     }

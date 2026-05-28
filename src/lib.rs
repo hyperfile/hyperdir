@@ -1,5 +1,4 @@
 use std::io::Result;
-use std::cmp::Ordering;
 use std::time::SystemTime;
 use std::str::FromStr;
 use std::collections::HashMap;
@@ -124,20 +123,19 @@ impl DirScatterInode {
             }
         }
 
-        // iter map to sort by last_modified (if eq) and then ulid dt for each filename group
+        // iter map to build a total order per filename group:
+        //   1. last_modified (S3-side time)
+        //   2. ulid (full 128-bit, monotonic per process)
+        //   3. key (S3 object key, globally unique by S3 semantics)
+        // The third tier is belt-and-suspenders: ulid alone is already unique
+        // unless two writers in the same millisecond happen to draw colliding
+        // randomness, but key uniqueness is guaranteed by S3 itself, so this
+        // gives a stable total order without panics.
         for (_, v) in map.iter_mut() {
             v.sort_by(|a, b| {
-                let res = a.last_modified.cmp(&b.last_modified);
-                let res = if res == Ordering::Equal {
-                    a.ulid.datetime().cmp(&b.ulid.datetime())
-                } else {
-                    res
-                };
-                if res == Ordering::Equal {
-                    // FIXME: should be recoverable of this case
-                    panic!("can not decide sequence of two scatter");
-                }
-                res
+                a.last_modified.cmp(&b.last_modified)
+                    .then_with(|| a.ulid.cmp(&b.ulid))
+                    .then_with(|| a.key.cmp(&b.key))
             });
         }
 
