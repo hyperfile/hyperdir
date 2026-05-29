@@ -96,10 +96,12 @@ struct ScatterChanges {
     /// for any keys that appear in `tombstone_keys`. `read_dir` ignores
     /// this field.
     all_keys: Vec<String>,
-    /// Hash -> entry, for filenames whose latest scatter is Create or Update.
-    upserts: HashMap<EntryNameHash, DirFileEntryRaw>,
-    /// Hashes whose latest scatter is Delete.
-    deletes: HashSet<EntryNameHash>,
+    /// Filename -> entry, for filenames whose latest scatter is Create or
+    /// Update. Keyed by the full filename (not its hash) so two distinct
+    /// names that share a CRC64 are both preserved within one batch.
+    upserts: HashMap<String, DirFileEntryRaw>,
+    /// Filenames whose latest scatter is Delete.
+    deletes: HashSet<String>,
     /// Subset of `all_keys`: the latest Delete scatter per filename. These
     /// must NOT be deleted by `compact`; they remain in S3 as tombstones
     /// until `fs_gc` reclaims them after their retention expires.
@@ -110,6 +112,13 @@ struct ScatterChanges {
 fn hash_filename(name: &str) -> EntryNameHash {
     let mut c = crc64fast::Digest::new();
     c.write(name.as_bytes());
+    c.sum64()
+}
+
+#[inline]
+fn hash_filename_bytes(name: &[u8]) -> EntryNameHash {
+    let mut c = crc64fast::Digest::new();
+    c.write(name);
     c.sum64()
 }
 
@@ -301,16 +310,24 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         &self.flags
     }
 
-    pub async fn read_entry(&self, hash: &EntryNameHash) -> Result<DirFileEntry> {
-        let entry_raw = self.bmap.lookup(hash).await?;
-        Ok(DirFileEntry::from_raw(&entry_raw))
+    /// Look up a single directory entry by name.
+    ///
+    /// Resolves CRC64 collisions by open-addressing: probes from the name's
+    /// home slot, comparing the full name stored in each entry until a match
+    /// or an empty slot (NotFound) is found.
+    pub async fn read_entry(&self, name: &str) -> Result<DirFileEntry> {
+        let home = hash_filename(name);
+        match self.probe_lookup(name.as_bytes(), home).await? {
+            Some((_, entry)) => Ok(DirFileEntry::from_raw(&entry)),
+            None => Err(Error::new(ErrorKind::NotFound, format!("entry not found: {}", name))),
+        }
     }
 
     /// Pure-read directory enumeration.
     ///
     /// Lists outstanding scatter objects, walks the persisted bmap, and merges
-    /// the two views in memory. Does not modify any S3 state, so it is safe to
-    /// call concurrently from multiple clients.
+    /// the two views in memory keyed by filename. Does not modify any S3
+    /// state, so it is safe to call concurrently from multiple clients.
     ///
     /// The returned snapshot reflects "the latest scatter applied on top of
     /// the bmap as of the LIST/GET round-trips". Two consecutive calls may
@@ -319,20 +336,22 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     pub async fn read_dir(&self) -> Result<Vec<DirFileEntry>> {
         let changes = self.collect_scatter_changes().await?;
 
-        // start from the persisted bmap snapshot
-        let mut view = self.walk_bmap_snapshot().await?;
-
-        // overlay scatter changes
-        for (hash, entry) in changes.upserts {
-            view.insert(hash, entry);
+        // start from the persisted bmap snapshot, keyed by filename
+        let mut view: HashMap<String, DirFileEntryRaw> = HashMap::new();
+        for entry in self.walk_bmap_snapshot().await? {
+            view.insert(String::from_utf8_lossy(entry.name_bytes()).into_owned(), entry);
         }
-        for hash in &changes.deletes {
-            view.remove(hash);
+
+        // overlay scatter changes (also keyed by filename)
+        for (name, entry) in changes.upserts {
+            view.insert(name, entry);
+        }
+        for name in &changes.deletes {
+            view.remove(name);
         }
 
         Ok(view
             .into_values()
-            .filter(|raw| !raw.is_dummy())
             .map(|raw| DirFileEntry::from_raw(&raw))
             .collect())
     }
@@ -376,22 +395,19 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         let tombstones_kept = changes.tombstone_keys.len();
 
         let mut entries_added = 0;
-        for (hash, entry) in &changes.upserts {
-            let _ = self.bmap.insert(*hash, *entry).await?;
+        for (name, entry) in &changes.upserts {
+            self.probe_upsert(name.as_bytes(), *entry).await?;
             entries_added += 1;
         }
 
         let mut entries_removed = 0;
-        for hash in &changes.deletes {
-            match self.bmap.delete(hash).await {
-                Ok(_) => entries_removed += 1,
-                // Tombstone for a name that was never persisted (e.g., a file
-                // created and deleted before any compact ran), or already
-                // consolidated by a previous compact run that only kept the
-                // tombstone object. Idempotent.
-                Err(e) if e.kind() == ErrorKind::NotFound => {},
-                Err(e) => return Err(e),
+        for name in &changes.deletes {
+            if self.probe_delete(name.as_bytes()).await? {
+                entries_removed += 1;
             }
+            // A tombstone for a name that was never persisted (created and
+            // deleted before any compact ran, or already consolidated) just
+            // returns false; idempotent.
         }
 
         // hyperfile's flush handles OCC retry per FlushConflictPolicy.
@@ -451,30 +467,29 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         }
 
         let fetched = self.staging.collect_scatter_inodes(to_fetch).await?;
-        let mut upserts: HashMap<EntryNameHash, DirFileEntryRaw> = HashMap::new();
+        let mut upserts: HashMap<String, DirFileEntryRaw> = HashMap::new();
         for (s, body) in fetched {
-            let hash = hash_filename(&s.filename);
             let inode_raw = InodeRaw::from_u8_slice(&body);
             let entry = DirFileEntryRaw::from(
                 &inode_raw,
                 s.uuid.as_bytes(),
                 <String as AsRef<OsStr>>::as_ref(&s.filename).as_encoded_bytes(),
             );
-            upserts.insert(hash, entry);
+            upserts.insert(s.filename, entry);
         }
 
-        let mut deletes: HashSet<EntryNameHash> = HashSet::new();
+        let mut deletes: HashSet<String> = HashSet::new();
         for s in to_remove {
-            deletes.insert(hash_filename(&s.filename));
+            deletes.insert(s.filename);
         }
 
         Ok(ScatterChanges { all_keys, upserts, deletes, tombstone_keys })
     }
 
-    /// Walk the persisted bmap read-only, returning the set of valid entries.
+    /// Walk the persisted bmap read-only, returning all valid entries.
     /// Skips dummy values inserted by hyperfile as bmap placeholders.
-    async fn walk_bmap_snapshot(&self) -> Result<HashMap<EntryNameHash, DirFileEntryRaw>> {
-        let mut map: HashMap<EntryNameHash, DirFileEntryRaw> = HashMap::new();
+    async fn walk_bmap_snapshot(&self) -> Result<Vec<DirFileEntryRaw>> {
+        let mut out: Vec<DirFileEntryRaw> = Vec::new();
         let opt_last_key = match self.bmap.last_key().await {
             Ok(k) => Some(k),
             Err(e) if e.kind() == ErrorKind::NotFound => None,
@@ -493,7 +508,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
                 }
                 let val = self.bmap.lookup(&key).await?;
                 if !val.is_dummy() {
-                    map.insert(key, val);
+                    out.push(val);
                 }
                 if key == BlockIndex::MAX {
                     break;
@@ -501,7 +516,89 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
                 n = key + 1;
             }
         }
-        Ok(map)
+        Ok(out)
+    }
+
+    /// Probe from `home` for the slot holding `name`, returning its
+    /// (slot, entry) or `None` if absent. Linear probing: a slot whose entry
+    /// is a dummy or a colliding (different) name is skipped; the first
+    /// absent slot (NotFound) terminates the chain.
+    ///
+    /// Probing does not wrap; with CRC64 spread uniformly over u64 and tiny
+    /// clusters in practice, a chain reaching `u64::MAX` does not occur.
+    async fn probe_lookup(&self, name: &[u8], home: BlockIndex) -> Result<Option<(BlockIndex, DirFileEntryRaw)>> {
+        let mut k = home;
+        loop {
+            match self.bmap.lookup(&k).await {
+                Ok(entry) => {
+                    if !entry.is_dummy() && entry.name_eq(name) {
+                        return Ok(Some((k, entry)));
+                    }
+                },
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e),
+            }
+            k = match k.checked_add(1) {
+                Some(next) => next,
+                None => return Ok(None),
+            };
+        }
+    }
+
+    /// Insert or update `entry` for `name`: write at the existing slot if the
+    /// name is already present, else at the first empty slot in the probe
+    /// chain from the name's home slot.
+    async fn probe_upsert(&mut self, name: &[u8], entry: DirFileEntryRaw) -> Result<()> {
+        let home = hash_filename_bytes(name);
+        let mut k = home;
+        loop {
+            match self.bmap.lookup(&k).await {
+                Ok(existing) => {
+                    if !existing.is_dummy() && existing.name_eq(name) {
+                        break; // update in place at k
+                    }
+                },
+                Err(e) if e.kind() == ErrorKind::NotFound => break, // empty slot at k
+                Err(e) => return Err(e),
+            }
+            k = k.checked_add(1)
+                .ok_or_else(|| Error::other("probe chain exhausted u64 key space"))?;
+        }
+        let _ = self.bmap.insert(k, entry).await?;
+        Ok(())
+    }
+
+    /// Delete `name`, repairing the probe chain with backward-shift so no gap
+    /// breaks the lookup of entries that probed past the removed slot.
+    /// Returns false if `name` was not present.
+    async fn probe_delete(&mut self, name: &[u8]) -> Result<bool> {
+        let home = hash_filename_bytes(name);
+        let slot = match self.probe_lookup(name, home).await? {
+            Some((k, _)) => k,
+            None => return Ok(false),
+        };
+
+        // Backward-shift: scan forward from the hole; move any following entry
+        // whose home slot is at or before the hole into the hole.
+        let mut hole = slot;
+        let mut j = match slot.checked_add(1) { Some(v) => v, None => slot };
+        while j != slot {
+            let entry_j = match self.bmap.lookup(&j).await {
+                Ok(e) => e,
+                Err(e) if e.kind() == ErrorKind::NotFound => break, // cluster ended
+                Err(e) => return Err(e),
+            };
+            // Dummies don't occur for directory bmaps in practice; treat one
+            // as home == j so it never shifts.
+            let home_j = if entry_j.is_dummy() { j } else { hash_filename_bytes(entry_j.name_bytes()) };
+            if home_j <= hole {
+                let _ = self.bmap.insert(hole, entry_j).await?;
+                hole = j;
+            }
+            j = match j.checked_add(1) { Some(v) => v, None => break };
+        }
+        self.bmap.delete(&hole).await?;
+        Ok(true)
     }
 }
 

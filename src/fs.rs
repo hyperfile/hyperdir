@@ -11,7 +11,7 @@ use hyperfile::staging::{Staging, config::StagingConfig, s3::S3Staging, StagingI
 use hyperfile::file::HyperTrait;
 use hyperfile::ondisk::InodeRaw;
 use crate::hyper::HyperDir;
-use crate::file::{EntryNameHash, DirFileEntry, CompactStats};
+use crate::file::{DirFileEntry, CompactStats};
 use crate::interceptor::ScatterFirstInterceptor;
 use crate::layout::HyperDirLayout;
 use crate::{
@@ -368,10 +368,10 @@ impl<'a> HyperDir<'a>
         return Self::update_stat_fast(client.clone(), file_config, stat).await;
     }
 
-    pub async fn fs_read_entry(&self, hash: &EntryNameHash) -> Result<DirFileEntry>
+    pub async fn fs_read_entry(&self, name: &str) -> Result<DirFileEntry>
     {
-        debug!("fs_read_entry - ");
-        self.inner.read_entry(hash).await
+        debug!("fs_read_entry - name: {}", name);
+        self.inner.read_entry(name).await
     }
 
     pub async fn fs_read_dir(&self) -> Result<Vec<DirFileEntry>>
