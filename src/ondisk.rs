@@ -119,4 +119,15 @@ impl DirFileEntryRaw {
     pub fn is_dummy(&self) -> bool {
         self.name == DUMMY_FILENAME
     }
+
+    /// The stored filename bytes, up to (not including) the NUL terminator.
+    pub fn name_bytes(&self) -> &[u8] {
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(self.name.len());
+        &self.name[..end]
+    }
+
+    /// True if this entry's filename equals `name` (raw byte compare).
+    pub fn name_eq(&self, name: &[u8]) -> bool {
+        self.name_bytes() == name
+    }
 }
