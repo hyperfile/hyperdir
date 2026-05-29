@@ -13,6 +13,7 @@ use hyperfile::config::HyperFileRuntimeConfig;
 use hyperfile::staging::{Staging, config::StagingConfig, s3::S3Staging, StagingIntercept};
 use hyperfile::file::HyperTrait;
 use hyperfile::ondisk::InodeRaw;
+use hyperfile::inode::FlushInodeFlag;
 use crate::hyper::HyperDir;
 use crate::file::{DirFileEntry, CompactStats};
 use crate::interceptor::ScatterFirstInterceptor;
@@ -229,7 +230,69 @@ impl<'a> HyperDir<'a>
             StagingConfig::new_s3_uri(&parent_dir_uri, None),
             runtime_config,
         ).await?;
-        parent_staging.emit_scatter_event(name, child_uuid, &body, DirScatterInodeOp::Delete).await
+        parent_staging.emit_scatter_event(name, child_uuid, &body, DirScatterInodeOp::Delete).await?;
+
+        // Decrement the file's authoritative link count, after the tombstone
+        // so a crash in between over-counts (a storage leak fs_gc won't
+        // reclaim) rather than under-counts (premature reclamation). Only
+        // files carry hard links here; a directory has exactly one name and
+        // is reclaimed by fs_gc unconditionally.
+        if !child_is_dir {
+            if let Err(e) = adjust_nlink(client, &child_uri, -1).await {
+                warn!("fs_unlink: nlink decrement failed for {}: {}", child_uri, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a hard link `new_name` in `parent_dir_uuid` to the existing file
+    /// `target_file_uuid`.
+    ///
+    /// Bumps the target file's authoritative link count (stored in the file's
+    /// own inode) and adds a directory entry pointing at the same UUID. Hard
+    /// links to directories are rejected. Fails with `AlreadyExists` if
+    /// `new_name` already exists in the parent.
+    ///
+    /// The link-count bump and the entry insert are not atomic: a crash
+    /// between them over-counts (storage leak), never under-counts.
+    pub async fn fs_link(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+        parent_dir_uuid: &Uuid,
+        new_name: &str,
+        target_file_uuid: &Uuid,
+    ) -> Result<()>
+    {
+        let child_uri = layout.file_uri(bucket, target_file_uuid);
+        debug!("fs_link - parent: {}, name: {}, target: {}", parent_dir_uuid, new_name, child_uri);
+
+        let mut parent = Self::fs_open_dir_uuid(client, layout, bucket, parent_dir_uuid, FileFlags::rdwr()).await?;
+        if parent.inner.read_entry(new_name).await.is_ok() {
+            return Err(Error::new(ErrorKind::AlreadyExists,
+                format!("link target name exists: {}/{}", parent_dir_uuid, new_name)));
+        }
+
+        // Load the target inode; reject directory targets.
+        let runtime_config = HyperFileRuntimeConfig::default();
+        let target_staging = S3Staging::from(
+            client,
+            StagingConfig::new_s3_uri(&child_uri, None),
+            runtime_config,
+        ).await?;
+        let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        let _ = target_staging.load_inode(raw_inode.as_mut_u8_slice()).await?;
+        if is_dir_mode(raw_inode.i_mode) {
+            return Err(Error::new(ErrorKind::InvalidInput,
+                format!("hard link to a directory is not allowed: {}", child_uri)));
+        }
+
+        // Bump the authoritative nlink, then add the new entry.
+        let new_nlink = adjust_nlink(client, &child_uri, 1).await?;
+        raw_inode.i_nlink = new_nlink;
+        let entry = crate::ondisk::DirFileEntryRaw::from(&raw_inode, target_file_uuid.as_bytes(), new_name.as_bytes());
+        parent.inner.insert_entry(new_name, entry).await?;
+        Ok(())
     }
 
     /// Remove an empty child directory.
@@ -347,24 +410,47 @@ impl<'a> HyperDir<'a>
             // Resolve the child's prefix from its UUID and kind. The kind is
             // recovered from the inode mode stored in the tombstone.
             let inode_raw = InodeRaw::from_u8_slice(inode_raw_bytes);
-            let child_uri = if is_dir_mode(inode_raw.i_mode) {
+            let is_dir = is_dir_mode(inode_raw.i_mode);
+            let child_uri = if is_dir {
                 layout.dir_uri(bucket, &scatter.uuid)
             } else {
                 layout.file_uri(bucket, &scatter.uuid)
             };
-            match reclaim_child_prefix(client, &child_uri, runtime_config.clone()).await {
-                Ok(_) => {},
-                Err(e) => {
-                    warn!("fs_gc: failed to reclaim child {}: {}", child_uri, e);
-                    stats.errors += 1;
-                    continue;
-                },
+
+            // A file may still be reachable through other hard links; reclaim
+            // only when its authoritative link count has reached zero. A
+            // missing child inode means a previous GC already reclaimed it.
+            // Directories carry exactly one name and are reclaimed outright.
+            let should_reclaim = if is_dir {
+                true
+            } else {
+                match current_nlink(client, &child_uri).await {
+                    Ok(Some(n)) => n == 0,
+                    Ok(None) => true,
+                    Err(e) => {
+                        warn!("fs_gc: failed to read nlink for {}: {}", child_uri, e);
+                        stats.errors += 1;
+                        continue;
+                    },
+                }
+            };
+
+            if should_reclaim {
+                match reclaim_child_prefix(client, &child_uri, runtime_config.clone()).await {
+                    Ok(_) => {},
+                    Err(e) => {
+                        warn!("fs_gc: failed to reclaim child {}: {}", child_uri, e);
+                        stats.errors += 1;
+                        continue;
+                    },
+                }
             }
 
             // Tombstone scatter object goes last: a partial GC that crashes
             // here will leave the tombstone behind, and a future fs_gc will
             // observe a missing child prefix (handled as already-cleaned)
-            // and finish the job.
+            // and finish the job. The tombstone is removed whether or not the
+            // child storage was reclaimed -- this name is gone either way.
             if let Err(e) = parent_staging.remove_scatter_inodes(vec![scatter.key.clone()]).await {
                 warn!("fs_gc: failed to delete tombstone s3://{}/{}: {}",
                       parent_staging.bucket, scatter.key, e);
@@ -711,6 +797,47 @@ async fn delete_object(client: &Client, bucket: &str, key: &str) -> Result<()> {
 /// True if a Unix mode word denotes a directory (`S_IFDIR`).
 fn is_dir_mode(mode: u32) -> bool {
     (mode & libc::S_IFMT) == libc::S_IFDIR
+}
+
+/// Maximum optimistic-concurrency retries for an nlink read-modify-write.
+const NLINK_RETRIES: usize = 5;
+
+/// Read-modify-write a file's authoritative `i_nlink` by `delta`, returning
+/// the new value. Uses a staging with no scatter interceptor (an nlink change
+/// is not a directory-listing event) and retries on the inode's OCC conflict.
+/// The count saturates at zero.
+async fn adjust_nlink(client: &Client, child_uri: &str, delta: i64) -> Result<u64> {
+    let staging = S3Staging::from(
+        client,
+        StagingConfig::new_s3_uri(child_uri, None),
+        HyperFileRuntimeConfig::default(),
+    ).await?;
+    for _ in 0..NLINK_RETRIES {
+        let mut raw: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        let od_state = staging.load_inode(raw.as_mut_u8_slice()).await?;
+        let new_nlink = (raw.i_nlink as i64 + delta).max(0) as u64;
+        raw.i_nlink = new_nlink;
+        match staging.flush_inode(raw.as_u8_slice(), &od_state, FlushInodeFlag::Update).await {
+            Ok(_) => return Ok(new_nlink),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::new(ErrorKind::ResourceBusy, "adjust_nlink: too many OCC conflicts"))
+}
+
+/// Read a file's current authoritative `i_nlink`. Returns `None` if the child
+/// inode no longer exists (already reclaimed).
+async fn current_nlink(client: &Client, child_uri: &str) -> Result<Option<u64>> {
+    match S3Staging::from(client, StagingConfig::new_s3_uri(child_uri, None), HyperFileRuntimeConfig::default()).await {
+        Ok(staging) => {
+            let mut raw: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+            let _ = staging.load_inode(raw.as_mut_u8_slice()).await?;
+            Ok(Some(raw.i_nlink))
+        },
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// GET a single scatter / tombstone object, returning its body bytes.
