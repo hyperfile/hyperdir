@@ -80,6 +80,37 @@ impl<'a> HyperDir<'a>
         Ok((dir, uuid))
     }
 
+    /// Create the root directory (`DIR/<nil-uuid>`).
+    ///
+    /// The root has no parent, so no scatter interceptor is installed: nothing
+    /// observes the root's existence through a parent. Errors with
+    /// `AlreadyExists` if the root already exists.
+    pub async fn fs_create_root(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+        flags: FileFlags,
+        mode: FileMode,
+    ) -> Result<Self>
+    {
+        let uri = layout.root_dir_uri(bucket);
+        debug!("fs_create_root - uri: {}", uri);
+        Self::fs_create(client, &uri, flags, mode).await
+    }
+
+    /// Open the root directory (`DIR/<nil-uuid>`).
+    pub async fn fs_open_root(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+        flags: FileFlags,
+    ) -> Result<Self>
+    {
+        let uri = layout.root_dir_uri(bucket);
+        debug!("fs_open_root - uri: {}", uri);
+        Self::fs_open(client, &uri, flags).await
+    }
+
     pub async fn fs_open(client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
     {
         debug!("fs_open - uri: {}, flags: {}", uri, flags);
@@ -196,6 +227,42 @@ impl<'a> HyperDir<'a>
             runtime_config,
         ).await?;
         parent_staging.emit_scatter_event(name, child_uuid, &body, DirScatterInodeOp::Delete).await
+    }
+
+    /// Remove an empty child directory.
+    ///
+    /// Opens the child directory and verifies it has no entries (merging its
+    /// bmap with any outstanding scatter via `read_dir`); returns
+    /// `ErrorKind::DirectoryNotEmpty` otherwise. On success it emits a Delete
+    /// tombstone into the parent exactly like [`fs_unlink`], so physical
+    /// reclamation is deferred to [`fs_gc`] under `retention`.
+    ///
+    /// The emptiness check and the tombstone are not atomic: an entry created
+    /// in the child between the two steps can be lost. A caller that needs
+    /// strict semantics must serialize rmdir against creates under the child
+    /// (a higher-layer concern).
+    pub async fn fs_rmdir(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+        parent_dir_uuid: &Uuid,
+        name: &str,
+        child_dir_uuid: &Uuid,
+        retention: Option<Duration>,
+    ) -> Result<()>
+    {
+        let child_uri = layout.dir_uri(bucket, child_dir_uuid);
+        debug!("fs_rmdir - child: {}, name: {}", child_uri, name);
+
+        let child = Self::fs_open(client, &child_uri, FileFlags::rdonly()).await?;
+        let entries = child.fs_read_dir().await?;
+        if !entries.is_empty() {
+            return Err(Error::new(ErrorKind::DirectoryNotEmpty,
+                format!("directory not empty: {} ({} entries)", name, entries.len())));
+        }
+        drop(child);
+
+        Self::fs_unlink(client, layout, bucket, parent_dir_uuid, name, child_dir_uuid, true, retention).await
     }
 
     /// Reclaim physical storage for tombstoned children whose retention has
