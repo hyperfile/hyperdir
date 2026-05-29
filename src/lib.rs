@@ -30,6 +30,9 @@ pub mod file;
 pub mod s3;
 pub mod hyper;
 pub mod fs;
+pub mod interceptor;
+
+pub use interceptor::ScatterFirstInterceptor;
 
 pub const DEFAULT_DIR_INODE_SCATTER_FOLDER: &str = "!";
 pub const DEFAULT_DIR_INODE_MARKER: &str = "inode_";
