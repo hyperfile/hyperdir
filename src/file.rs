@@ -32,6 +32,26 @@ use super::{DirStaging, DirScatterInode, DirScatterInodeOp};
 
 pub const DIR_FILE_ENTRY_RAW_SIZE: usize = std::mem::size_of::<DirFileEntryRaw>();
 
+/// A directory entry as seen through the parent directory.
+///
+/// Authority model:
+/// - The parent directory is authoritative for the **namespace**: the
+///   `name -> uuid` mapping and whether the name exists.
+/// - The file's own inode (at its `FILE/<uuid>` / `DIR/<uuid>` prefix, and
+///   embedded in each of its segments) is authoritative for **file
+///   metadata**: mode, size, times, and `nlink`.
+/// - The `inode` carried here is a *cached snapshot* taken from the latest
+///   scatter the parent consolidated. It is an advisory readdir/stat
+///   optimization and may lag the authoritative file inode. For a
+///   hard-linked file in particular, the cached `nlink` is only advisory:
+///   the count is shared across all of the file's names and only the file's
+///   own inode tracks it correctly.
+///
+/// Consequence for consumers: after opening a file through this entry
+/// (by `uuid`, optionally pinning the version via `inode`'s last cno, which
+/// resolves to the segment whose embedded inode is authoritative), refresh
+/// the in-memory `nlink` (and any other metadata that matters) from the
+/// opened file's inode rather than trusting this cached copy.
 #[derive(Debug)]
 pub struct DirFileEntry {
     pub inode: Inode,
