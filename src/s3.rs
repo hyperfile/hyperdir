@@ -3,9 +3,10 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use log::{warn, error};
 use ulid::Ulid;
+use uuid::Uuid;
 use aws_sdk_s3::primitives::SdkBody;
 use hyperfile::staging::config::StagingConfig;
-use hyperfile::staging::{Staging, s3::S3Staging};
+use hyperfile::staging::s3::S3Staging;
 use super::{DirStaging, DirScatterInode, DirScatterInodeOp, CompactLeaseGuard};
 use super::{DEFAULT_DIR_INODE_MARKER, DEFAULT_DIR_INODE_SCATTER_FOLDER, DEFAULT_COMPACT_LEASE_FILE};
 use super::{format_lease_body, parse_lease_body, unix_now_ms};
@@ -101,21 +102,6 @@ impl DirStaging for S3Staging {
         Ok(())
     }
 
-    fn to_dir_staging(staging: &S3Staging) -> S3Staging {
-        let mut staging = staging.clone();
-        let path = std::path::Path::new(&staging.root_path);
-        let parent_path = path.parent()
-            .expect("invalid top dir, dir staging must have parent")
-            .to_str()
-            .expect("unable to decode parent to utf8 string")
-            .to_owned();
-
-        staging.root_path = parent_path.to_string();
-        staging.root_path_slash = format!("{}/", staging.root_path);
-        staging.inode_file = format!("{}/inode", staging.root_path);
-        staging
-    }
-
     fn to_dir_staging_config(config: &StagingConfig) -> StagingConfig {
         let mut config = config.clone();
         assert!(!config.root_uri.ends_with('/'));
@@ -124,9 +110,10 @@ impl DirStaging for S3Staging {
         config
     }
 
-    async fn emit_scatter_event(&self, buf: &[u8], op: DirScatterInodeOp) -> Result<()> {
-        let (dir, filename) = self.dir_filename();
-        let key = DirScatterInode::path_encode(dir, filename, op.clone() as u8);
+    async fn emit_scatter_event(&self, filename: &str, child_uuid: &Uuid, buf: &[u8], op: DirScatterInodeOp) -> Result<()> {
+        // `self` is the parent directory's staging; its root_path is the
+        // directory's own prefix and the scatter lands in its `!/` namespace.
+        let key = DirScatterInode::path_encode(&self.root_path, filename, child_uuid, op.clone() as u8);
         let mut builder = self.client
             .put_object()
             .bucket(&self.bucket)

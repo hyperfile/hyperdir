@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use std::ffi::CStr;
 use std::collections::{HashMap, HashSet, BTreeMap};
 use log::warn;
+use uuid::Uuid;
 use tokio::sync::{
     Semaphore, OwnedSemaphorePermit,
     Mutex, OwnedMutexGuard,
@@ -34,6 +35,7 @@ pub const DIR_FILE_ENTRY_RAW_SIZE: usize = std::mem::size_of::<DirFileEntryRaw>(
 #[derive(Debug)]
 pub struct DirFileEntry {
     pub inode: Inode,
+    pub uuid: Uuid,
     pub name: String,
 }
 
@@ -59,6 +61,7 @@ impl DirFileEntry {
 
         Self {
             inode: Inode::from_raw(&raw.inode, None),
+            uuid: Uuid::from_bytes(raw.uuid),
             name,
         }
     }
@@ -454,6 +457,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             let inode_raw = InodeRaw::from_u8_slice(&body);
             let entry = DirFileEntryRaw::from(
                 &inode_raw,
+                s.uuid.as_bytes(),
                 <String as AsRef<OsStr>>::as_ref(&s.filename).as_encoded_bytes(),
             );
             upserts.insert(hash, entry);
