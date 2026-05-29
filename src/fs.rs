@@ -9,6 +9,7 @@ use hyperfile::staging::{Staging, config::StagingConfig, s3::S3Staging, StagingI
 use hyperfile::file::HyperTrait;
 use crate::hyper::HyperDir;
 use crate::file::{EntryNameHash, DirFileEntry};
+use crate::interceptor::ScatterFirstInterceptor;
 
 impl<'a> HyperDir<'a>
 {
@@ -34,6 +35,20 @@ impl<'a> HyperDir<'a>
         let f = HyperFileFlags::from_flags(flags);
         let m = HyperFileMode::from_mode(mode);
         return Self::create_with_interceptor(client.clone(), file_config, f, m, interceptor).await;
+    }
+
+    /// Convenience over `fs_create_with_interceptor` that installs the
+    /// default Plan A interceptor (`ScatterFirstInterceptor`).
+    ///
+    /// Use this when you want the standard hyperdir commit semantics:
+    /// every flush of this file's inode first emits a scatter object into
+    /// the parent directory's `!/` prefix as a conditional PUT, which is
+    /// the durable commit point of the change. The subsequent file inode
+    /// PUT is best-effort replication.
+    pub async fn fs_create_default(client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
+    {
+        debug!("fs_create_default - uri: {}, flags: {}", uri, flags);
+        Self::fs_create_with_interceptor(client, uri, flags, mode, ScatterFirstInterceptor::new()).await
     }
 
     pub async fn fs_open(client: &Client, uri: &str, flags: FileFlags) -> Result<Self>

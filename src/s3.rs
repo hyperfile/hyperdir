@@ -1,7 +1,7 @@
 use std::io::{Result, Error, ErrorKind};
 use std::time::SystemTime;
 use bytes::Bytes;
-use log::error;
+use log::{warn, error};
 use aws_sdk_s3::primitives::SdkBody;
 use hyperfile::staging::config::StagingConfig;
 use hyperfile::staging::{Staging, s3::S3Staging};
@@ -125,31 +125,56 @@ impl DirStaging for S3Staging {
     async fn emit_scatter_event(&self, buf: &[u8], op: DirScatterInodeOp) -> Result<()> {
         let (dir, filename) = self.dir_filename();
         let key = DirScatterInode::path_encode(dir, filename, op.clone() as u8);
-        let builder = self.client
+        let mut builder = self.client
             .put_object()
             .bucket(&self.bucket)
             .key(&key);
-        let builder = match op {
+        builder = match op {
             DirScatterInodeOp::Create | DirScatterInodeOp::Update => {
                 let body = SdkBody::from(buf);
                 builder.body(body.into())
             },
             DirScatterInodeOp::PreDelete | DirScatterInodeOp::Delete => {
+                // tombstone: empty body, the op encoded in the key is enough
                 builder
             },
-            _ => {
-                panic!("unknown DirScatterInodeOp {:?}", op);
+            DirScatterInodeOp::Unknown => {
+                return Err(Error::new(ErrorKind::InvalidInput,
+                    format!("emit_scatter_event called with Unknown op for s3://{}/{}",
+                            self.bucket, key)));
             },
         };
+
+        // If-None-Match: * makes this PUT exactly-once for its (ulid-named) key.
+        // The scatter object is Plan A's commit point: once this PUT succeeds the
+        // change is durably committed in the parent directory's view. The file's
+        // own inode object that hyperfile writes after this hook returns is a
+        // best-effort replication that any reader/compactor can redo idempotently.
+        builder = builder.if_none_match('*');
+
         match builder.send().await {
-            Ok(_) => {},
+            Ok(_) => Ok(()),
             Err(sdk_err) => {
+                // 412 Precondition Failed / 409 Conflict: an object already
+                // exists at this key. ULID uniqueness makes this essentially
+                // impossible in normal operation; we treat it as already
+                // committed and continue. If a future change reuses ULIDs across
+                // retries (for true exactly-once on the writer side), this
+                // branch should additionally verify body equivalence via GET
+                // before accepting.
+                if let Some(resp) = sdk_err.raw_response() {
+                    let st = resp.status().as_u16();
+                    if st == 412 || st == 409 {
+                        warn!("scatter PUT s3://{}/{} returned {} (treating as already committed)",
+                              self.bucket, key, st);
+                        return Ok(());
+                    }
+                }
                 let err_str = format!("PutObject s3://{}/{} error: {}", self.bucket, key, sdk_err);
                 error!("{}", err_str);
-                return Err(Error::other(err_str));
+                Err(Error::other(err_str))
             },
         }
-        Ok(())
     }
 
     fn scatter_inodes_path(&self) -> String {
