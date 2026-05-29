@@ -132,12 +132,16 @@ impl DirStaging for S3Staging {
             .bucket(&self.bucket)
             .key(&key);
         builder = match op {
-            DirScatterInodeOp::Create | DirScatterInodeOp::Update => {
+            DirScatterInodeOp::Create | DirScatterInodeOp::Update | DirScatterInodeOp::Delete => {
+                // Create/Update body = raw InodeRaw bytes.
+                // Delete body       = TombstoneHeader || raw InodeRaw bytes
+                //                     (see crate::TombstoneHeader docs).
                 let body = SdkBody::from(buf);
                 builder.body(body.into())
             },
-            DirScatterInodeOp::PreDelete | DirScatterInodeOp::Delete => {
-                // tombstone: empty body, the op encoded in the key is enough
+            DirScatterInodeOp::PreDelete => {
+                // 2-phase delete intent: empty body, op encoded in the key
+                // is enough. Not yet exercised end-to-end.
                 builder
             },
             DirScatterInodeOp::Unknown => {
@@ -148,10 +152,11 @@ impl DirStaging for S3Staging {
         };
 
         // If-None-Match: * makes this PUT exactly-once for its (ulid-named) key.
-        // The scatter object is Plan A's commit point: once this PUT succeeds the
-        // change is durably committed in the parent directory's view. The file's
-        // own inode object that hyperfile writes after this hook returns is a
-        // best-effort replication that any reader/compactor can redo idempotently.
+        // The scatter object is the durable commit point of a logical mutation:
+        // once this PUT succeeds the change is committed in the parent
+        // directory's view. The file's own inode object that hyperfile writes
+        // after this hook returns is a best-effort replication that any
+        // reader/compactor can redo idempotently.
         builder = builder.if_none_match('*');
 
         match builder.send().await {

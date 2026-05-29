@@ -1,4 +1,4 @@
-//! Plan A commit-point interceptor.
+//! Scatter-first commit interceptor.
 //!
 //! `ScatterFirstInterceptor` plugs into hyperfile's `StagingIntercept` so that
 //! every `flush_inode` call on a child file writes the parent directory's
@@ -17,8 +17,6 @@
 //! step 2 (or anything later) fails, the scatter alone is enough for a future
 //! reader/compactor to reconstruct the child inode by replaying the scatter
 //! body. Step 2 is therefore best-effort, idempotent replication.
-//!
-//! See `docs` (Plan A discussion) for the full crash-recovery matrix.
 
 use std::io::Result;
 use std::pin::Pin;
@@ -61,7 +59,16 @@ impl StagingIntercept<S3Staging> for ScatterFirstInterceptor {
             let op = match flag {
                 FlushInodeFlag::Create => DirScatterInodeOp::Create,
                 FlushInodeFlag::Update => DirScatterInodeOp::Update,
-                FlushInodeFlag::Delete => DirScatterInodeOp::Delete,
+                // Delete scatters are emitted by fs_unlink with a tombstone
+                // body (TombstoneHeader || InodeRaw), not via this hook. If
+                // hyperfile ever wires flush_inode(Delete) to a real call
+                // path, the bytes hyperfile would pass here are just the
+                // inode raw, which the GC and undelete paths cannot parse as
+                // a tombstone. Skip rather than emit a malformed body.
+                FlushInodeFlag::Delete => {
+                    debug!("ScatterFirstInterceptor: skipping FlushInodeFlag::Delete (use fs_unlink instead)");
+                    return Ok(());
+                },
                 // Internal hyperfile flags that aren't real commits in the
                 // parent-directory sense; nothing to scatter.
                 FlushInodeFlag::Ignore | FlushInodeFlag::Unkown => {
@@ -80,9 +87,10 @@ impl StagingIntercept<S3Staging> for ScatterFirstInterceptor {
         _flag: FlushInodeFlag,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + '_ + Send>> {
         // Nothing to do: the file inode write that just completed is the
-        // best-effort replication step in Plan A. If it failed, hyperfile's
-        // own retry loop already handled it; if it succeeded, the parent's
-        // scatter is still the source of truth.
+        // best-effort replication of the scatter we already committed in
+        // before_flush_inode. If the inode PUT failed, hyperfile's own retry
+        // loop already handled it; if it succeeded, the parent's scatter is
+        // still the source of truth.
         Box::pin(async { Ok(()) })
     }
 

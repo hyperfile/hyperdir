@@ -75,6 +75,10 @@ pub struct CompactStats {
     pub entries_added: usize,
     /// Number of bmap entries removed from Delete scatters.
     pub entries_removed: usize,
+    /// Number of Delete scatters that won their filename group and were
+    /// retained in S3 as tombstones (subject to retention; reclaimed by
+    /// [`HyperDir::fs_gc`]).
+    pub tombstones_kept: usize,
     /// True when the scatter list was empty; flush + scatter cleanup were
     /// skipped and this call had no S3 side effects.
     pub no_op: bool,
@@ -85,13 +89,18 @@ pub struct CompactStats {
 /// the persisted bmap (`compact`).
 struct ScatterChanges {
     /// All scatter object keys that were observed in the LIST. A successful
-    /// compact will delete this set after the bmap flush commits. `read_dir`
-    /// ignores this field.
+    /// compact will delete this set after the bmap flush commits, *except*
+    /// for any keys that appear in `tombstone_keys`. `read_dir` ignores
+    /// this field.
     all_keys: Vec<String>,
     /// Hash -> entry, for filenames whose latest scatter is Create or Update.
     upserts: HashMap<EntryNameHash, DirFileEntryRaw>,
     /// Hashes whose latest scatter is Delete.
     deletes: HashSet<EntryNameHash>,
+    /// Subset of `all_keys`: the latest Delete scatter per filename. These
+    /// must NOT be deleted by `compact`; they remain in S3 as tombstones
+    /// until `fs_gc` reclaims them after their retention expires.
+    tombstone_keys: HashSet<String>,
 }
 
 #[inline]
@@ -361,6 +370,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         }
 
         let scatters_processed = changes.all_keys.len();
+        let tombstones_kept = changes.tombstone_keys.len();
 
         let mut entries_added = 0;
         for (hash, entry) in &changes.upserts {
@@ -373,7 +383,9 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             match self.bmap.delete(hash).await {
                 Ok(_) => entries_removed += 1,
                 // Tombstone for a name that was never persisted (e.g., a file
-                // created and deleted before any compact ran). Idempotent.
+                // created and deleted before any compact ran), or already
+                // consolidated by a previous compact run that only kept the
+                // tombstone object. Idempotent.
                 Err(e) if e.kind() == ErrorKind::NotFound => {},
                 Err(e) => return Err(e),
             }
@@ -382,15 +394,23 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         // hyperfile's flush handles OCC retry per FlushConflictPolicy.
         self.flush().await?;
 
-        // Best-effort scatter cleanup. If this PUT batch fails, the next
-        // compact will see and re-process the same scatters; the bmap-side
-        // operations above are idempotent so re-application is safe.
-        self.staging.remove_scatter_inodes(changes.all_keys).await?;
+        // Best-effort scatter cleanup. Keep tombstones (latest Delete scatter
+        // per filename) so fs_gc can find and process them after retention;
+        // strip everything else: stale scatters of any op, plus consolidated
+        // Create/Update winners. Re-application on the bmap side is
+        // idempotent if we ever see a tombstone twice.
+        let to_delete: Vec<String> = changes.all_keys.into_iter()
+            .filter(|k| !changes.tombstone_keys.contains(k))
+            .collect();
+        if !to_delete.is_empty() {
+            self.staging.remove_scatter_inodes(to_delete).await?;
+        }
 
         Ok(CompactStats {
             scatters_processed,
             entries_added,
             entries_removed,
+            tombstones_kept,
             no_op: false,
         })
     }
@@ -406,6 +426,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
 
         let mut to_remove = Vec::new();
         let mut to_fetch = Vec::new();
+        let mut tombstone_keys: HashSet<String> = HashSet::new();
         for s in last_view {
             match s.op {
                 DirScatterInodeOp::Unknown => {
@@ -414,7 +435,14 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
                 DirScatterInodeOp::PreDelete => {
                     warn!("scatter inode of PreDelete (not yet implemented): {}", s.key);
                 },
-                DirScatterInodeOp::Delete => to_remove.push(s),
+                DirScatterInodeOp::Delete => {
+                    // The latest Delete per filename is a tombstone; remember
+                    // its key so compact won't strip it from S3. Older Delete
+                    // scatters for the same name aren't in last_view and will
+                    // be cleaned up like ordinary stale scatter.
+                    tombstone_keys.insert(s.key.clone());
+                    to_remove.push(s);
+                },
                 DirScatterInodeOp::Create | DirScatterInodeOp::Update => to_fetch.push(s),
             }
         }
@@ -436,7 +464,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             deletes.insert(hash_filename(&s.filename));
         }
 
-        Ok(ScatterChanges { all_keys, upserts, deletes })
+        Ok(ScatterChanges { all_keys, upserts, deletes, tombstone_keys })
     }
 
     /// Walk the persisted bmap read-only, returning the set of valid entries.
