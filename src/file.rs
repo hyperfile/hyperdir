@@ -600,6 +600,43 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         self.bmap.delete(&hole).await?;
         Ok(true)
     }
+
+    /// Rename an entry within this directory.
+    ///
+    /// Same-directory rename is cheap under UUID identity: the child keeps its
+    /// UUID and underlying storage; only the parent's name->entry mapping
+    /// changes. Both bmap edits (remove old, insert new) are staged in memory
+    /// and committed by a single inode flush, so the rename is atomic against
+    /// concurrent writers via hyperfile's inode OCC.
+    ///
+    /// The destination must not already exist; replace-over-existing returns
+    /// `AlreadyExists` and is left to the caller (it would otherwise orphan
+    /// the displaced child's storage). `old_name == new_name` is a no-op.
+    pub async fn rename_within(&mut self, old_name: &str, new_name: &str) -> Result<()> {
+        if old_name == new_name {
+            return Ok(());
+        }
+        let old_home = hash_filename(old_name);
+        let entry = match self.probe_lookup(old_name.as_bytes(), old_home).await? {
+            Some((_, e)) => e,
+            None => return Err(Error::new(ErrorKind::NotFound,
+                format!("rename source not found: {}", old_name))),
+        };
+        let new_home = hash_filename(new_name);
+        if self.probe_lookup(new_name.as_bytes(), new_home).await?.is_some() {
+            return Err(Error::new(ErrorKind::AlreadyExists,
+                format!("rename target exists: {}", new_name)));
+        }
+
+        // Same inode + uuid, new name.
+        let new_entry = DirFileEntryRaw::from(&entry.inode, &entry.uuid, new_name.as_bytes());
+        self.probe_delete(old_name.as_bytes()).await?;
+        self.probe_upsert(new_name.as_bytes(), new_entry).await?;
+
+        // One flush commits both bmap edits atomically.
+        self.flush().await?;
+        Ok(())
+    }
 }
 
 impl<'a, T, L> HyperTrait<T, L, NullNodeCache, DirFileEntryRaw> for HyperDirFile<'a, T, L>

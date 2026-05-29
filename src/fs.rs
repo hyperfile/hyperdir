@@ -462,6 +462,18 @@ impl<'a> HyperDir<'a>
         debug!("fs_compact - ");
         self.inner.compact().await
     }
+
+    /// Rename an entry within this (already-open, writable) directory.
+    ///
+    /// Same-directory rename keeps the child's UUID and storage; only this
+    /// directory's name->entry mapping changes, committed by a single inode
+    /// flush (atomic via hyperfile OCC). The destination must not exist
+    /// (otherwise `AlreadyExists`); `old_name == new_name` is a no-op.
+    pub async fn fs_rename(&mut self, old_name: &str, new_name: &str) -> Result<()>
+    {
+        debug!("fs_rename - {} -> {}", old_name, new_name);
+        self.inner.rename_within(old_name, new_name).await
+    }
 }
 
 /// Statistics returned from [`HyperDir::fs_gc`].
