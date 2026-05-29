@@ -7,7 +7,7 @@
 //! logical mutation:
 //!
 //! ```text
-//! 1. before_flush_inode  -> PUT  <parent dir>/!/inode_<ulid>_<name>_<uuid>_<op>
+//! 1. before_flush_inode  -> PUT  <parent dir>/!/<ulid>_<name>_<uuid>_<op>.inode
 //!                                with `If-None-Match: *`     (commit point)
 //! 2. hyperfile core      -> PUT  <child>/inode               (replication)
 //! 3. after_flush_inode   -> no-op

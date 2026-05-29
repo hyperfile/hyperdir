@@ -202,7 +202,10 @@ pub use fs::GcStats;
 pub use layout::{HyperDirLayout, ROOT_DIR_UUID};
 
 pub const DEFAULT_DIR_INODE_SCATTER_FOLDER: &str = "!";
-pub const DEFAULT_DIR_INODE_MARKER: &str = "inode_";
+/// Suffix of a live (Create/Update) inode scatter object.
+pub const DEFAULT_DIR_INODE_SUFFIX: &str = ".inode";
+/// Suffix of a tombstone (Delete) scatter object.
+pub const DEFAULT_DIR_TOMBSTONE_SUFFIX: &str = ".tombstone";
 
 #[derive(Clone, Debug)]
 #[repr(u8)]
@@ -237,7 +240,10 @@ pub struct DirScatterInode {
 }
 
 /// Scatter Inode Format:
-/// `<parent dir key>/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/inode_{ulid}_{base64(filename)}_{uuid}_{op}`
+/// `<parent dir key>/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/{ulid}_{base64(filename)}_{uuid}_{op}{suffix}`
+///
+/// `suffix` is `.tombstone` for a Delete op and `.inode` for everything else,
+/// so live entries and tombstones can be filtered by object suffix alone.
 ///
 /// `uuid` is the child's own UUID (the prefix where its hyperfile lives,
 /// `DIR/<uuid>` or `FILE/<uuid>`). It is carried in the key because a rename
@@ -248,28 +254,34 @@ impl DirScatterInode {
     pub fn path_decode(scatter_inode: &str, last_modified: SystemTime) -> Self {
         let components: Vec<&str> = scatter_inode.split(DEFAULT_DIR_INODE_SCATTER_FOLDER).collect();
         assert!(components.len() == 2);
-        assert!(components[1].starts_with("/inode_"));
 
         let key = scatter_inode.to_owned();
 
-        // "/inode_{ulid}_{base64(name)}_{uuid}_{op}" split on '_':
-        //   [ "/inode", ulid, base64(name), uuid, op ]
+        // components[1] = "/{ulid}_{base64(name)}_{uuid}_{op}{suffix}"
+        let stem = components[1]
+            .trim_start_matches('/')
+            .strip_suffix(DEFAULT_DIR_INODE_SUFFIX)
+            .or_else(|| components[1].trim_start_matches('/').strip_suffix(DEFAULT_DIR_TOMBSTONE_SUFFIX))
+            .expect("scatter object missing .inode/.tombstone suffix");
+
+        // "{ulid}_{base64(name)}_{uuid}_{op}" split on '_':
+        //   [ ulid, base64(name), uuid, op ]
         // base64 uses an alphabet of [*-A-Za-z0-9] (no '_') and the uuid is
         // hyphenated (no '_'), so '_' is an unambiguous separator.
-        let parts: Vec<&str> = components[1].split('_').collect();
+        let parts: Vec<&str> = stem.split('_').collect();
 
-        let ulid = Ulid::from_string(parts[1]).expect("failed to decode ulid from event path");
+        let ulid = Ulid::from_string(parts[0]).expect("failed to decode ulid from event path");
 
         let alphabet = alphabet::Alphabet::new("*-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789").unwrap();
         let crazy_config = engine::GeneralPurposeConfig::new()
             .with_decode_padding_mode(engine::DecodePaddingMode::RequireNone);
         let crazy_engine = engine::GeneralPurpose::new(&alphabet, crazy_config);
-        let decoded = crazy_engine.decode(parts[2]).expect("failed to decode filename from event path");
+        let decoded = crazy_engine.decode(parts[1]).expect("failed to decode filename from event path");
         let filename = String::from_utf8(decoded).expect("failed to get back string of filename");
 
-        let uuid = Uuid::parse_str(parts[3]).expect("failed to decode uuid from event path");
+        let uuid = Uuid::parse_str(parts[2]).expect("failed to decode uuid from event path");
 
-        let op_u8 = u8::from_str(parts[4]).expect("failed to decode DirScatterInodeOp from event path ");
+        let op_u8 = u8::from_str(parts[3]).expect("failed to decode DirScatterInodeOp from event path ");
         let op = DirScatterInodeOp::from_u8(op_u8);
 
         Self { key, op, ulid, uuid, filename, last_modified }
@@ -285,7 +297,13 @@ impl DirScatterInode {
         let crazy_engine = engine::GeneralPurpose::new(&alphabet, crazy_config);
         let encoded_filename = crazy_engine.encode(filename);
 
-        format!("{dir_staging_path}/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/inode_{ulid}_{encoded_filename}_{uuid}_{op}")
+        let suffix = if op == DirScatterInodeOp::Delete as u8 {
+            DEFAULT_DIR_TOMBSTONE_SUFFIX
+        } else {
+            DEFAULT_DIR_INODE_SUFFIX
+        };
+
+        format!("{dir_staging_path}/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/{ulid}_{encoded_filename}_{uuid}_{op}{suffix}")
     }
 
     // input:
@@ -330,5 +348,45 @@ impl DirScatterInode {
         }
 
         last_view
+    }
+}
+
+
+#[cfg(test)]
+mod scatter_key_tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn roundtrip(name: &str, op: DirScatterInodeOp) {
+        let uuid = Uuid::new_v4();
+        let op_u8 = op.clone() as u8;
+        let key = DirScatterInode::path_encode("DIR/parent-uuid", name, &uuid, op_u8);
+        let decoded = DirScatterInode::path_decode(&key, SystemTime::UNIX_EPOCH);
+        assert_eq!(decoded.filename, name);
+        assert_eq!(decoded.uuid, uuid);
+        assert_eq!(decoded.op as u8, op_u8);
+    }
+
+    #[test]
+    fn inode_suffix_for_non_delete() {
+        let key = DirScatterInode::path_encode(
+            "DIR/p", "foo", &Uuid::nil(), DirScatterInodeOp::Create as u8);
+        assert!(key.ends_with(DEFAULT_DIR_INODE_SUFFIX));
+        assert!(!key.ends_with(DEFAULT_DIR_TOMBSTONE_SUFFIX));
+    }
+
+    #[test]
+    fn tombstone_suffix_for_delete() {
+        let key = DirScatterInode::path_encode(
+            "DIR/p", "foo", &Uuid::nil(), DirScatterInodeOp::Delete as u8);
+        assert!(key.ends_with(DEFAULT_DIR_TOMBSTONE_SUFFIX));
+    }
+
+    #[test]
+    fn roundtrip_ops_and_names() {
+        roundtrip("hello.txt", DirScatterInodeOp::Create);
+        roundtrip("with space", DirScatterInodeOp::Update);
+        roundtrip("a/weird\\name", DirScatterInodeOp::Delete);
+        roundtrip("unicode-\u{6587}\u{4ef6}", DirScatterInodeOp::Create);
     }
 }
