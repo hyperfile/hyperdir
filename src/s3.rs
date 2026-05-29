@@ -2,11 +2,13 @@ use std::io::{Result, Error, ErrorKind};
 use std::time::SystemTime;
 use bytes::Bytes;
 use log::{warn, error};
+use ulid::Ulid;
 use aws_sdk_s3::primitives::SdkBody;
 use hyperfile::staging::config::StagingConfig;
 use hyperfile::staging::{Staging, s3::S3Staging};
-use super::{DirStaging, DirScatterInode, DirScatterInodeOp};
-use super::{DEFAULT_DIR_INODE_MARKER, DEFAULT_DIR_INODE_SCATTER_FOLDER};
+use super::{DirStaging, DirScatterInode, DirScatterInodeOp, CompactLeaseGuard};
+use super::{DEFAULT_DIR_INODE_MARKER, DEFAULT_DIR_INODE_SCATTER_FOLDER, DEFAULT_COMPACT_LEASE_FILE};
+use super::{format_lease_body, parse_lease_body, unix_now_ms};
 
 impl DirStaging for S3Staging {
     async fn list_scatter_inodes(&self) -> Result<Vec<DirScatterInode>> {
@@ -179,5 +181,177 @@ impl DirStaging for S3Staging {
 
     fn scatter_inodes_path(&self) -> String {
         format!("{}/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/", self.root_path)
+    }
+
+    fn compact_lease_path(&self) -> String {
+        format!("{}/{DEFAULT_COMPACT_LEASE_FILE}", self.root_path)
+    }
+
+    async fn acquire_compact_lease(&self, ttl_ms: u64) -> Result<CompactLeaseGuard> {
+        let lease_key = self.compact_lease_path();
+        let holder_id = Ulid::new().to_string();
+        let now_ms = unix_now_ms();
+        let expires_at_unix_ms = now_ms.saturating_add(ttl_ms as i64);
+        let body_str = format_lease_body(&holder_id, expires_at_unix_ms);
+        let body = SdkBody::from(body_str.as_bytes());
+
+        let res = self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&lease_key)
+            .body(body.into())
+            .if_none_match('*')
+            .send()
+            .await;
+
+        match res {
+            Ok(output) => {
+                let etag = output.e_tag.unwrap_or_default().replace('"', "");
+                Ok(CompactLeaseGuard { holder_id, etag, lease_key, expires_at_unix_ms })
+            },
+            Err(sdk_err) => {
+                // 412/409: a lease object already exists at this key. Decide
+                // whether it's still fresh or has expired (and is therefore
+                // takeable).
+                let is_conflict = sdk_err.raw_response()
+                    .map(|r| matches!(r.status().as_u16(), 412 | 409))
+                    .unwrap_or(false);
+                if is_conflict {
+                    return try_take_over_compact_lease(
+                        self, &lease_key, &holder_id, ttl_ms, now_ms).await;
+                }
+                let err_str = format!(
+                    "PutObject (acquire_compact_lease) s3://{}/{} error: {}",
+                    self.bucket, lease_key, sdk_err);
+                error!("{}", err_str);
+                Err(Error::other(err_str))
+            },
+        }
+    }
+
+    async fn release_compact_lease(&self, guard: CompactLeaseGuard) -> Result<()> {
+        let res = self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&guard.lease_key)
+            .if_match(&guard.etag)
+            .send()
+            .await;
+
+        match res {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                if let Some(resp) = sdk_err.raw_response() {
+                    if resp.status().as_u16() == 412 {
+                        // Our etag no longer matches: the lease was taken
+                        // over after expiration. Not an error from our side.
+                        warn!("compact lease s3://{}/{} was taken over before release (holder={})",
+                              self.bucket, guard.lease_key, guard.holder_id);
+                        return Ok(());
+                    }
+                }
+                // Any other error: log but don't fail. The lease will expire
+                // naturally on TTL; failing here would mask the actual
+                // compact result.
+                warn!("DeleteObject (release_compact_lease) s3://{}/{} error: {} (lease will expire on TTL)",
+                      self.bucket, guard.lease_key, sdk_err);
+                Ok(())
+            },
+        }
+    }
+}
+
+/// Helper for [`<S3Staging as DirStaging>::acquire_compact_lease`]: an object
+/// already exists at the lease key; check its expiration and either take it
+/// over (via `If-Match`) or report busy.
+///
+/// Lives as a free function rather than an inherent method on `S3Staging`
+/// because that type is defined in the `hyperfile` crate; Rust forbids
+/// inherent impls on out-of-crate types.
+async fn try_take_over_compact_lease(
+    staging: &S3Staging,
+    lease_key: &str,
+    holder_id: &str,
+    ttl_ms: u64,
+    now_ms: i64,
+) -> Result<CompactLeaseGuard> {
+    // Read the existing lease to see when it expires.
+    let res = staging.client
+        .get_object()
+        .bucket(&staging.bucket)
+        .key(lease_key)
+        .send()
+        .await;
+    let (existing_etag, existing_body) = match res {
+        Ok(out) => {
+            let etag = out.e_tag.clone().unwrap_or_default().replace('"', "");
+            let body = out.body.collect().await
+                .map_err(|e| Error::other(
+                    format!("read compact lease body s3://{}/{}: {}", staging.bucket, lease_key, e)))?
+                .into_bytes();
+            (etag, body)
+        },
+        Err(sdk_err) => {
+            // The lease object disappeared between our PUT-412 and GET.
+            // This is a race; report busy and let the caller retry on
+            // the next compaction cycle.
+            let err_str = format!(
+                "GetObject (try_take_over_compact_lease) s3://{}/{} error: {}",
+                staging.bucket, lease_key, sdk_err);
+            warn!("{}", err_str);
+            return Err(Error::new(ErrorKind::ResourceBusy, err_str));
+        },
+    };
+
+    let (existing_holder, existing_expires) = parse_lease_body(&existing_body)?;
+
+    if existing_expires > now_ms {
+        // Fresh lease held by someone else; back off.
+        return Err(Error::new(ErrorKind::ResourceBusy,
+            format!("compact lease s3://{}/{} held by {} until {}ms",
+                    staging.bucket, lease_key, existing_holder, existing_expires)));
+    }
+
+    // Lease has expired: try to take it over with If-Match on the etag.
+    let new_expires = now_ms.saturating_add(ttl_ms as i64);
+    let body_str = format_lease_body(holder_id, new_expires);
+    let body = SdkBody::from(body_str.as_bytes());
+
+    let res = staging.client
+        .put_object()
+        .bucket(&staging.bucket)
+        .key(lease_key)
+        .body(body.into())
+        .if_match(&existing_etag)
+        .send()
+        .await;
+
+    match res {
+        Ok(output) => {
+            let new_etag = output.e_tag.unwrap_or_default().replace('"', "");
+            warn!("compact lease s3://{}/{} taken over from expired holder {} (new holder {})",
+                  staging.bucket, lease_key, existing_holder, holder_id);
+            Ok(CompactLeaseGuard {
+                holder_id: holder_id.to_string(),
+                etag: new_etag,
+                lease_key: lease_key.to_string(),
+                expires_at_unix_ms: new_expires,
+            })
+        },
+        Err(sdk_err) => {
+            let is_conflict = sdk_err.raw_response()
+                .map(|r| matches!(r.status().as_u16(), 412 | 409))
+                .unwrap_or(false);
+            if is_conflict {
+                return Err(Error::new(ErrorKind::ResourceBusy,
+                    format!("lost race to take over expired compact lease s3://{}/{}",
+                            staging.bucket, lease_key)));
+            }
+            let err_str = format!(
+                "PutObject (take_over_compact_lease) s3://{}/{} error: {}",
+                staging.bucket, lease_key, sdk_err);
+            error!("{}", err_str);
+            Err(Error::other(err_str))
+        },
     }
 }
