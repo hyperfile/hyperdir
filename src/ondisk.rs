@@ -30,6 +30,10 @@ impl DirFileInodeRaw {
 #[repr(C, align(8))]
 pub struct DirFileEntryRaw {
     pub(crate) inode: InodeRaw,
+    /// UUID of the child's own prefix (`DIR/<uuid>` or `FILE/<uuid>`). This is
+    /// the stable identity used to address the child; the directory entry's
+    /// `name` may change via rename without touching it.
+    pub(crate) uuid: [u8; 16],
     pub(crate) name: [u8; DEFAULT_NAME_LEN + 1],
 }
 
@@ -47,15 +51,17 @@ impl Default for DirFileEntryRaw {
     fn default() -> Self {
         Self {
             inode: InodeRaw::default(),
+            uuid: [0u8; 16],
             name: [0u8; DEFAULT_NAME_LEN + 1],
         }
     }
 }
 
 impl DirFileEntryRaw {
-    pub fn from(inode_raw: &InodeRaw, filename: &[u8]) -> Self {
+    pub fn from(inode_raw: &InodeRaw, uuid: &[u8; 16], filename: &[u8]) -> Self {
         let mut raw: Self = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         raw.inode = *inode_raw;
+        raw.uuid = *uuid;
         // raw.name is DEFAULT_NAME_LEN + 1 bytes; the last byte is reserved for
         // the trailing NUL so DirFileEntry::from_raw can parse with CStr.
         // Hence the maximum usable filename byte length is DEFAULT_NAME_LEN.
@@ -105,6 +111,7 @@ impl DirFileEntryRaw {
     pub fn dummy_value() -> Self {
         Self {
             inode: InodeRaw::default(),
+            uuid: [0u8; 16],
             name: DUMMY_FILENAME,
         }
     }

@@ -1,6 +1,7 @@
 use std::io::{Result, Error, ErrorKind};
 use std::time::Duration;
 use log::{debug, warn};
+use uuid::Uuid;
 use aws_sdk_s3::Client;
 use hyperfile::file::flags::{FileFlags, HyperFileFlags};
 use hyperfile::file::mode::{FileMode, HyperFileMode};
@@ -12,6 +13,7 @@ use hyperfile::ondisk::InodeRaw;
 use crate::hyper::HyperDir;
 use crate::file::{EntryNameHash, DirFileEntry, CompactStats};
 use crate::interceptor::ScatterFirstInterceptor;
+use crate::layout::HyperDirLayout;
 use crate::{
     DirStaging, DirScatterInodeOp,
     build_tombstone_body, parse_tombstone_body, unix_now_ms,
@@ -43,18 +45,39 @@ impl<'a> HyperDir<'a>
         return Self::create_with_interceptor(client.clone(), file_config, f, m, interceptor).await;
     }
 
-    /// Convenience over `fs_create_with_interceptor` that installs the
-    /// default scatter-first interceptor (`ScatterFirstInterceptor`).
+    /// Create a child directory under `parent_dir_uuid`, returning the new
+    /// directory handle and the UUID allocated for it.
     ///
-    /// Use this when you want the standard hyperdir commit semantics:
-    /// every flush of this file's inode first emits a scatter object into
-    /// the parent directory's `!/` prefix as a conditional PUT, which is
-    /// the durable commit point of the change. The subsequent file inode
-    /// PUT is best-effort replication.
-    pub async fn fs_create_default(client: &Client, uri: &str, flags: FileFlags, mode: FileMode) -> Result<Self>
+    /// hyperdir owns directory-identity allocation: a fresh v4 UUID is
+    /// generated here and the directory's hyperfile is created at
+    /// `layout.dir_uri(bucket, new_uuid)`. A [`ScatterFirstInterceptor`] is
+    /// installed toward the parent so the first inode flush commits a scatter
+    /// into the parent's `!/` namespace. The parent must already exist.
+    ///
+    /// The root directory has no parent; create it with [`HyperDir::create`]
+    /// directly (no interceptor) at `layout.root_dir_uri(bucket)`.
+    pub async fn fs_create_default(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+        parent_dir_uuid: &Uuid,
+        name: &str,
+        flags: FileFlags,
+        mode: FileMode,
+    ) -> Result<(Self, Uuid)>
     {
-        debug!("fs_create_default - uri: {}, flags: {}", uri, flags);
-        Self::fs_create_with_interceptor(client, uri, flags, mode, ScatterFirstInterceptor::new()).await
+        let uuid = Uuid::new_v4();
+        let uri = layout.dir_uri(bucket, &uuid);
+        let parent_dir_uri = layout.dir_uri(bucket, parent_dir_uuid);
+        debug!("fs_create_default - uri: {}, parent: {}, name: {}", uri, parent_dir_uri, name);
+        let parent_staging = S3Staging::from(
+            client,
+            StagingConfig::new_s3_uri(&parent_dir_uri, None),
+            HyperFileRuntimeConfig::default(),
+        ).await?;
+        let interceptor = ScatterFirstInterceptor::new(parent_staging, name, uuid);
+        let dir = Self::fs_create_with_interceptor(client, &uri, flags, mode, interceptor).await?;
+        Ok((dir, uuid))
     }
 
     pub async fn fs_open(client: &Client, uri: &str, flags: FileFlags) -> Result<Self>
@@ -92,7 +115,7 @@ impl<'a> HyperDir<'a>
         return Self::do_open_or_create(client.clone(), file_config, f, m, true).await;
     }
 
-    /// Delete a file by emitting a tombstone scatter to its parent directory.
+    /// Delete a child by emitting a tombstone scatter to its parent directory.
     ///
     /// This method does **not** physically delete the child's S3 prefix. It
     /// opens the child briefly to capture its current `InodeRaw`, builds a
@@ -103,6 +126,10 @@ impl<'a> HyperDir<'a>
     /// the authoritative deletion record. Physical reclamation of the child
     /// prefix is the job of [`fs_gc`], which honours `retention`.
     ///
+    /// `parent_dir_uuid` / `name` identify the entry in the parent;
+    /// `child_uuid` is the child's own UUID and `child_is_dir` selects the
+    /// `DIR/` vs `FILE/` namespace for the child's prefix.
+    ///
     /// `retention`:
     /// - `None` => `retention_until_unix_ms = 0`. The next `fs_gc` may
     ///   immediately reclaim the child storage. From the user's perspective
@@ -110,16 +137,38 @@ impl<'a> HyperDir<'a>
     /// - `Some(d)` => the child storage is preserved for at least `d` past
     ///   `now`. Until the retention expires `fs_gc` will leave the child
     ///   prefix alone, which is what makes a future undelete possible.
-    pub async fn fs_unlink(client: &Client, uri: &str, retention: Option<Duration>) -> Result<()>
+    // Addressing context is passed as discrete components; this is a
+    // provisional surface pending the consumer (hyperfs) driving it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fs_unlink(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+        parent_dir_uuid: &Uuid,
+        name: &str,
+        child_uuid: &Uuid,
+        child_is_dir: bool,
+        retention: Option<Duration>,
+    ) -> Result<()>
     {
-        debug!("fs_unlink - uri: {}, retention: {:?}", uri, retention);
+        let child_uri = if child_is_dir {
+            layout.dir_uri(bucket, child_uuid)
+        } else {
+            layout.file_uri(bucket, child_uuid)
+        };
+        let parent_dir_uri = layout.dir_uri(bucket, parent_dir_uuid);
+        debug!("fs_unlink - child: {}, parent: {}, name: {}, retention: {:?}",
+               child_uri, parent_dir_uri, name, retention);
 
         // Open the child staging just long enough to read its current inode.
         // We do not modify the child here; the prefix is left in place to be
         // reclaimed by `fs_gc` after the retention window.
-        let staging_config = StagingConfig::new_s3_uri(uri, None);
         let runtime_config = HyperFileRuntimeConfig::default();
-        let child_staging = S3Staging::from(client, staging_config, runtime_config).await?;
+        let child_staging = S3Staging::from(
+            client,
+            StagingConfig::new_s3_uri(&child_uri, None),
+            runtime_config.clone(),
+        ).await?;
 
         let mut raw_inode: InodeRaw = unsafe {
             std::mem::MaybeUninit::zeroed().assume_init()
@@ -140,20 +189,24 @@ impl<'a> HyperDir<'a>
         // Body = TombstoneHeader || raw inode bytes.
         let body = build_tombstone_body(now_ms, retention_until_unix_ms, raw_inode.as_u8_slice());
 
-        // Derive the parent staging from the child path (current path-based
-        // addressing; will switch to an explicit parent context once UUID
-        // addressing lands) and commit the tombstone there.
-        let parent_staging = <S3Staging as DirStaging>::to_dir_staging(&child_staging);
-        parent_staging.emit_scatter_event(&body, DirScatterInodeOp::Delete).await
+        // Commit the tombstone into the parent directory's scatter namespace.
+        let parent_staging = S3Staging::from(
+            client,
+            StagingConfig::new_s3_uri(&parent_dir_uri, None),
+            runtime_config,
+        ).await?;
+        parent_staging.emit_scatter_event(name, child_uuid, &body, DirScatterInodeOp::Delete).await
     }
 
     /// Reclaim physical storage for tombstoned children whose retention has
     /// expired.
     ///
-    /// Lists scatter objects under the parent at `parent_uri`, picks out the
-    /// `Delete` (tombstone) scatters, reads each one's `TombstoneHeader`, and
-    /// for every tombstone whose `retention_until_unix_ms <= now_ms`:
-    ///   1. resolves the child URI from the parent path + filename,
+    /// Lists scatter objects under the parent directory `parent_dir_uuid`,
+    /// picks out the `Delete` (tombstone) scatters, reads each one's
+    /// `TombstoneHeader`, and for every tombstone whose
+    /// `retention_until_unix_ms <= now_ms`:
+    ///   1. resolves the child URI from the child UUID carried in the scatter
+    ///      and the file/dir mode read from the tombstone's `InodeRaw`,
     ///   2. opens the child staging and calls `unlink()` to remove the
     ///      child's prefix in full (inode + segments + scatter folder),
     ///   3. deletes the tombstone scatter object.
@@ -168,12 +221,21 @@ impl<'a> HyperDir<'a>
     /// `fs_gc` is intentionally separate from `fs_compact`. Compact is
     /// expected to run at high frequency; GC walks tombstones, issues
     /// physical deletes, and is appropriate for cron/admin cadence.
-    pub async fn fs_gc(client: &Client, parent_uri: &str) -> Result<GcStats>
+    pub async fn fs_gc(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+        parent_dir_uuid: &Uuid,
+    ) -> Result<GcStats>
     {
+        let parent_uri = layout.dir_uri(bucket, parent_dir_uuid);
         debug!("fs_gc - parent_uri: {}", parent_uri);
-        let staging_config = StagingConfig::new_s3_uri(parent_uri, None);
         let runtime_config = HyperFileRuntimeConfig::default();
-        let parent_staging = S3Staging::from(client, staging_config, runtime_config.clone()).await?;
+        let parent_staging = S3Staging::from(
+            client,
+            StagingConfig::new_s3_uri(&parent_uri, None),
+            runtime_config.clone(),
+        ).await?;
 
         let scatters = parent_staging.list_scatter_inodes().await?;
         let now_ms = unix_now_ms();
@@ -186,7 +248,8 @@ impl<'a> HyperDir<'a>
             }
             stats.tombstones_visited += 1;
 
-            // Read the tombstone body to extract the retention deadline.
+            // Read the tombstone body to extract the retention deadline and
+            // the child's inode (whose mode tells us DIR vs FILE namespace).
             let body = match get_object_bytes(&parent_staging, &scatter.key).await {
                 Ok(b) => b,
                 Err(e) => {
@@ -196,7 +259,7 @@ impl<'a> HyperDir<'a>
                     continue;
                 },
             };
-            let (header, _inode_raw) = match parse_tombstone_body(&body) {
+            let (header, inode_raw_bytes) = match parse_tombstone_body(&body) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("fs_gc: malformed tombstone body s3://{}/{}: {}",
@@ -211,13 +274,14 @@ impl<'a> HyperDir<'a>
                 continue;
             }
 
-            // Reclaim physical storage of the child. Note: with path-based
-            // addressing, the child URI is parent_path + "/" + filename. The
-            // upcoming UUID-based layout will instead resolve via the
-            // child_uuid encoded in the scatter key, but the rest of this
-            // logic stays the same.
-            let child_uri = format!("s3://{}/{}/{}",
-                parent_staging.bucket, parent_staging.root_path, scatter.filename);
+            // Resolve the child's prefix from its UUID and kind. The kind is
+            // recovered from the inode mode stored in the tombstone.
+            let inode_raw = InodeRaw::from_u8_slice(inode_raw_bytes);
+            let child_uri = if is_dir_mode(inode_raw.i_mode) {
+                layout.dir_uri(bucket, &scatter.uuid)
+            } else {
+                layout.file_uri(bucket, &scatter.uuid)
+            };
             match reclaim_child_prefix(client, &child_uri, runtime_config.clone()).await {
                 Ok(_) => {},
                 Err(e) => {
@@ -348,6 +412,11 @@ pub struct GcStats {
     /// malformed body, etc.). These are left in S3 and a subsequent `fs_gc`
     /// call may retry them. The detailed reason is in the log at `warn` level.
     pub errors: usize,
+}
+
+/// True if a Unix mode word denotes a directory (`S_IFDIR`).
+fn is_dir_mode(mode: u32) -> bool {
+    (mode & libc::S_IFMT) == libc::S_IFDIR
 }
 
 /// GET a single scatter / tombstone object, returning its body bytes.

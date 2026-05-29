@@ -16,6 +16,7 @@ tokio = { version = "1", features = ["sync", "time"] }
 libc = "0.2.170"
 bytes = "1.10.1"
 ulid = "1.2.1"
+uuid = { version = "1", features = ["v4"] }
 base64 = "0.22.1"
 crc64fast = "1.1.0"
 aws-sdk-s3 = "1.85.0"

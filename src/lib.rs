@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::collections::HashMap;
 use bytes::Bytes;
 use ulid::Ulid;
+use uuid::Uuid;
 use base64::{engine, alphabet, Engine as _};
 use hyperfile::staging::config::StagingConfig;
 
@@ -15,12 +16,15 @@ pub trait DirStaging {
     async fn collect_scatter_inodes(&self, v_scatters: Vec<DirScatterInode>) -> Result<Vec<(DirScatterInode, Bytes)>>;
     // remove list of inode object on dir staging
     async fn remove_scatter_inodes(&self, v: Vec<String>) -> Result<()>;
-    // convert from file level staging to dir level
-    fn to_dir_staging(staging: &Self) -> Self;
     // convert from generic staging config to dir staging config
     fn to_dir_staging_config(config: &StagingConfig) -> StagingConfig;
-    // emit scatter event to dir location based on input file level staging
-    async fn emit_scatter_event(&self, buf: &[u8], op: DirScatterInodeOp) -> Result<()>;
+    // Emit a scatter event into THIS directory's `!/` namespace.
+    //
+    // `self` is the parent directory's staging (the directory that owns the
+    // entry). `filename` and `child_uuid` identify the child whose change is
+    // being committed. The parent cannot be derived from the child's prefix
+    // under UUID addressing, so both must be supplied explicitly.
+    async fn emit_scatter_event(&self, filename: &str, child_uuid: &Uuid, buf: &[u8], op: DirScatterInodeOp) -> Result<()>;
     // get scatter inodes path
     fn scatter_inodes_path(&self) -> String;
 
@@ -190,10 +194,12 @@ pub mod s3;
 pub mod hyper;
 pub mod fs;
 pub mod interceptor;
+pub mod layout;
 
 pub use interceptor::ScatterFirstInterceptor;
 pub use file::CompactStats;
 pub use fs::GcStats;
+pub use layout::{HyperDirLayout, ROOT_DIR_UUID};
 
 pub const DEFAULT_DIR_INODE_SCATTER_FOLDER: &str = "!";
 pub const DEFAULT_DIR_INODE_MARKER: &str = "inode_";
@@ -225,11 +231,18 @@ pub struct DirScatterInode {
     pub key: String,
     pub op: DirScatterInodeOp,
     pub ulid: Ulid,
+    pub uuid: Uuid,
     pub filename: String,
     pub last_modified: SystemTime,
 }
 
-/// Scatter Inode Format: dir/staging/dirname/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/[inode]_{ulid}_{filename in base64}_{op}
+/// Scatter Inode Format:
+/// `<parent dir key>/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/inode_{ulid}_{base64(filename)}_{uuid}_{op}`
+///
+/// `uuid` is the child's own UUID (the prefix where its hyperfile lives,
+/// `DIR/<uuid>` or `FILE/<uuid>`). It is carried in the key because a rename
+/// changes only `filename` while the child keeps its identity, and because
+/// the parent cannot otherwise recover the child's prefix from its name.
 impl DirScatterInode {
     // decode path to dir staging root and file name
     pub fn path_decode(scatter_inode: &str, last_modified: SystemTime) -> Self {
@@ -239,6 +252,10 @@ impl DirScatterInode {
 
         let key = scatter_inode.to_owned();
 
+        // "/inode_{ulid}_{base64(name)}_{uuid}_{op}" split on '_':
+        //   [ "/inode", ulid, base64(name), uuid, op ]
+        // base64 uses an alphabet of [*-A-Za-z0-9] (no '_') and the uuid is
+        // hyphenated (no '_'), so '_' is an unambiguous separator.
         let parts: Vec<&str> = components[1].split('_').collect();
 
         let ulid = Ulid::from_string(parts[1]).expect("failed to decode ulid from event path");
@@ -250,13 +267,15 @@ impl DirScatterInode {
         let decoded = crazy_engine.decode(parts[2]).expect("failed to decode filename from event path");
         let filename = String::from_utf8(decoded).expect("failed to get back string of filename");
 
-        let op_u8 = u8::from_str(parts[3]).expect("failed to decode DirScatterInodeOp from event path ");
+        let uuid = Uuid::parse_str(parts[3]).expect("failed to decode uuid from event path");
+
+        let op_u8 = u8::from_str(parts[4]).expect("failed to decode DirScatterInodeOp from event path ");
         let op = DirScatterInodeOp::from_u8(op_u8);
 
-        Self { key, op, ulid, filename, last_modified }
+        Self { key, op, ulid, uuid, filename, last_modified }
     }
 
-    pub fn path_encode(dir_staging_path: &str, filename: &str, op: u8) -> String {
+    pub fn path_encode(dir_staging_path: &str, filename: &str, uuid: &Uuid, op: u8) -> String {
         assert!(!dir_staging_path.ends_with("/"));
         let ulid = Ulid::new().to_string();
 
@@ -266,7 +285,7 @@ impl DirScatterInode {
         let crazy_engine = engine::GeneralPurpose::new(&alphabet, crazy_config);
         let encoded_filename = crazy_engine.encode(filename);
 
-        format!("{dir_staging_path}/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/inode_{ulid}_{encoded_filename}_{op}")
+        format!("{dir_staging_path}/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/inode_{ulid}_{encoded_filename}_{uuid}_{op}")
     }
 
     // input:
