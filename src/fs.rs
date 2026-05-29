@@ -8,6 +8,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::SdkBody;
 use hyperfile::file::flags::{FileFlags, HyperFileFlags};
 use hyperfile::file::mode::{FileMode, HyperFileMode};
+use hyperfile::file::hyper::Hyper as HyperFileHandle;
 use hyperfile::config::HyperFileConfigBuilder;
 use hyperfile::config::HyperFileRuntimeConfig;
 use hyperfile::staging::{Staging, config::StagingConfig, s3::S3Staging, StagingIntercept};
@@ -82,6 +83,40 @@ impl<'a> HyperDir<'a>
         let interceptor = ScatterFirstInterceptor::new(parent_staging, name, uuid);
         let dir = Self::fs_create_with_interceptor(client, &uri, flags, mode, interceptor).await?;
         Ok((dir, uuid))
+    }
+
+    /// Create a regular file `name` under `parent_dir_uuid`, returning an open
+    /// hyperfile handle for byte I/O and the UUID allocated for it.
+    ///
+    /// Mirrors [`fs_create_default`] but creates a FILE (`layout.file_uri`)
+    /// and hands back hyperfile's `Hyper`: the namespace (name -> uuid) is
+    /// hyperdir's via the scatter interceptor, while byte content is
+    /// hyperfile's. An initial flush is issued here so the file's inode object
+    /// and the parent's Create scatter both exist before returning — the file
+    /// is immediately stat-able and visible to `read_dir`.
+    pub async fn fs_create_file(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+        parent_dir_uuid: &Uuid,
+        name: &str,
+        flags: FileFlags,
+        mode: FileMode,
+    ) -> Result<(HyperFileHandle<'static>, Uuid)>
+    {
+        let uuid = Uuid::new_v4();
+        let uri = layout.file_uri(bucket, &uuid);
+        let parent_dir_uri = layout.dir_uri(bucket, parent_dir_uuid);
+        debug!("fs_create_file - uri: {}, parent: {}, name: {}", uri, parent_dir_uri, name);
+        let parent_staging = S3Staging::from(
+            client,
+            StagingConfig::new_s3_uri(&parent_dir_uri, None),
+            HyperFileRuntimeConfig::default(),
+        ).await?;
+        let interceptor = ScatterFirstInterceptor::new(parent_staging, name, uuid);
+        let mut file = HyperFileHandle::fs_create_with_interceptor(client, &uri, flags, mode, interceptor).await?;
+        file.fs_flush().await?;
+        Ok((file, uuid))
     }
 
     /// Create the root directory (`DIR/<nil-uuid>`).

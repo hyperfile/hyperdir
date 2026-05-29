@@ -177,7 +177,7 @@ async fn create_file(
 
 async fn file_nlink(client: &Client, layout: &HyperDirLayout, bucket: &str, uuid: &Uuid) -> std::io::Result<u64> {
     let st = HyperDir::fs_getattr_fast(client, &layout.file_uri(bucket, uuid)).await?;
-    Ok(st.st_nlink as u64)
+    Ok(st.st_nlink)
 }
 
 async fn file_exists(client: &Client, layout: &HyperDirLayout, bucket: &str, uuid: &Uuid) -> bool {
