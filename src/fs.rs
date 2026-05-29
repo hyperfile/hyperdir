@@ -8,7 +8,7 @@ use hyperfile::config::HyperFileRuntimeConfig;
 use hyperfile::staging::{Staging, config::StagingConfig, s3::S3Staging, StagingIntercept};
 use hyperfile::file::HyperTrait;
 use crate::hyper::HyperDir;
-use crate::file::{EntryNameHash, DirFileEntry};
+use crate::file::{EntryNameHash, DirFileEntry, CompactStats};
 use crate::interceptor::ScatterFirstInterceptor;
 
 impl<'a> HyperDir<'a>
@@ -169,9 +169,22 @@ impl<'a> HyperDir<'a>
         self.inner.read_entry(hash).await
     }
 
-    pub async fn fs_read_dir(&mut self) -> Result<Vec<DirFileEntry>>
+    pub async fn fs_read_dir(&self) -> Result<Vec<DirFileEntry>>
     {
         debug!("fs_readdir - ");
         self.inner.read_dir().await
+    }
+
+    /// Consolidate outstanding scatter objects into the persisted bmap.
+    ///
+    /// Should be called periodically by a single coordinator (cron, leader,
+    /// or admin tool). Concurrent compactors on the same directory are made
+    /// safe by hyperfile's per-inode OCC; one wins, the others retry per
+    /// `FlushConflictPolicy`. A future revision will add a leader lease so
+    /// only one client does the work in the common case.
+    pub async fn fs_compact(&mut self) -> Result<CompactStats>
+    {
+        debug!("fs_compact - ");
+        self.inner.compact().await
     }
 }
