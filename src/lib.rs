@@ -33,6 +33,7 @@ pub mod fs;
 pub mod interceptor;
 
 pub use interceptor::ScatterFirstInterceptor;
+pub use file::CompactStats;
 
 pub const DEFAULT_DIR_INODE_SCATTER_FOLDER: &str = "!";
 pub const DEFAULT_DIR_INODE_MARKER: &str = "inode_";

@@ -7,7 +7,7 @@ use std::sync::Weak;
 use std::pin::Pin;
 use std::ffi::OsStr;
 use std::ffi::CStr;
-use std::collections::{HashMap, BTreeMap};
+use std::collections::{HashMap, HashSet, BTreeMap};
 use log::warn;
 use tokio::sync::{
     Semaphore, OwnedSemaphorePermit,
@@ -65,6 +65,41 @@ impl DirFileEntry {
 }
 
 pub(crate) type EntryNameHash = u64;
+
+/// Statistics returned from [`HyperDirFile::compact`].
+#[derive(Default, Debug, Clone, Copy)]
+pub struct CompactStats {
+    /// Number of scatter objects listed and processed in this round.
+    pub scatters_processed: usize,
+    /// Number of bmap entries inserted/updated from Create/Update scatters.
+    pub entries_added: usize,
+    /// Number of bmap entries removed from Delete scatters.
+    pub entries_removed: usize,
+    /// True when the scatter list was empty; flush + scatter cleanup were
+    /// skipped and this call had no S3 side effects.
+    pub no_op: bool,
+}
+
+/// Internal: the result of listing + classifying + body-fetching scatter
+/// objects, ready to be applied to either an in-memory view (`read_dir`) or
+/// the persisted bmap (`compact`).
+struct ScatterChanges {
+    /// All scatter object keys that were observed in the LIST. A successful
+    /// compact will delete this set after the bmap flush commits. `read_dir`
+    /// ignores this field.
+    all_keys: Vec<String>,
+    /// Hash -> entry, for filenames whose latest scatter is Create or Update.
+    upserts: HashMap<EntryNameHash, DirFileEntryRaw>,
+    /// Hashes whose latest scatter is Delete.
+    deletes: HashSet<EntryNameHash>,
+}
+
+#[inline]
+fn hash_filename(name: &str) -> EntryNameHash {
+    let mut c = crc64fast::Digest::new();
+    c.write(name.as_bytes());
+    c.sum64()
+}
 
 impl NodeValue for DirFileEntryRaw {
     fn is_invalid(&self) -> bool {
@@ -259,122 +294,165 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         Ok(DirFileEntry::from_raw(&entry_raw))
     }
 
-    pub async fn read_dir(&mut self) -> Result<Vec<DirFileEntry>> {
-        // #1. list all inodes
-        let v_scattered_inodes = self.staging.list_scatter_inodes().await?;
-        // build all scatters key list
-        let v_all_scatters_key: Vec<String> = v_scattered_inodes.iter().map(|s| s.key.to_owned()).collect();
+    /// Pure-read directory enumeration.
+    ///
+    /// Lists outstanding scatter objects, walks the persisted bmap, and merges
+    /// the two views in memory. Does not modify any S3 state, so it is safe to
+    /// call concurrently from multiple clients.
+    ///
+    /// The returned snapshot reflects "the latest scatter applied on top of
+    /// the bmap as of the LIST/GET round-trips". Two consecutive calls may
+    /// differ if other writers commit between them. Outstanding scatter
+    /// objects are *not* deleted here; that is the job of [`compact`].
+    pub async fn read_dir(&self) -> Result<Vec<DirFileEntry>> {
+        let changes = self.collect_scatter_changes().await?;
 
-        // #2. dedup inodes to get latest view and fetch inode raw
-        let v_last_view = DirScatterInode::filter_last_view(v_scattered_inodes);
+        // start from the persisted bmap snapshot
+        let mut view = self.walk_bmap_snapshot().await?;
 
-        // group by fetch and remove op
-        let mut v_removed = Vec::new();
-        let mut v_fetch = Vec::new();
-        for scatter in v_last_view.into_iter() {
-            match scatter.op {
-                DirScatterInodeOp::Unknown => {
-                    warn!("a scatter inode of unknown op: {}", scatter.key);
-                },
-                DirScatterInodeOp::PreDelete => {
-                    warn!("a scatter inode of PreDelete, not yet implemented");
-                },
-                DirScatterInodeOp::Delete => {
-                    v_removed.push(scatter);
-                },
-                _ => {
-                    v_fetch.push(scatter);
-                },
-            }
+        // overlay scatter changes
+        for (hash, entry) in changes.upserts {
+            view.insert(hash, entry);
         }
-        let v_fetched_scattered_inodes = self.staging.collect_scatter_inodes(v_fetch).await?;
-
-        // #3. transform
-        let mut v_transformed_scattered_inodes: HashMap<EntryNameHash, DirFileEntryRaw> = HashMap::new();
-        for (scatter, bytes) in v_fetched_scattered_inodes.into_iter() {
-            // calc crc64
-            let mut c = crc64fast::Digest::new();
-            c.write(scatter.filename.as_bytes());
-            let hashed_name = c.sum64();
-            // convert bytes to inode raw
-            let inode_raw = InodeRaw::from_u8_slice(&bytes);
-            // filename into OsStr
-            let entry_raw = DirFileEntryRaw::from(&inode_raw, <String as AsRef<OsStr>>::as_ref(&scatter.filename).as_encoded_bytes());
-            v_transformed_scattered_inodes.insert(hashed_name, entry_raw);
+        for hash in &changes.deletes {
+            view.remove(hash);
         }
 
-        // #4. apply changed and deleted into bmap
-        // apply changed
-        for (hashed_name, entry_raw) in v_transformed_scattered_inodes.iter() {
-            // force update bmap
-            let _ = self.bmap.insert(*hashed_name, *entry_raw).await?;
-        }
-        // apply deleted
-        for scatter in v_removed.iter() {
-            // calc crc64
-            let mut c = crc64fast::Digest::new();
-            c.write(scatter.filename.as_bytes());
-            let hashed_name = c.sum64();
-            match self.bmap.delete(&hashed_name).await {
-                Ok(_) => {},
-                Err(e) => {
-                    if e.kind() != ErrorKind::NotFound {
-                        return Err(e);
-                    }
-                    // if not found means file not exists in bmap,
-                    // let's ignore and continue
-                },
-            }
+        Ok(view
+            .into_values()
+            .filter(|raw| !raw.is_dummy())
+            .map(|raw| DirFileEntry::from_raw(&raw))
+            .collect())
+    }
+
+    /// Consolidate outstanding scatter objects into the persisted bmap.
+    ///
+    /// Lists scatter, applies Create/Update/Delete to the bmap, flushes the
+    /// directory's own hyperfile, and deletes the scatter objects. Hyperfile's
+    /// own [`FlushConflictPolicy`](hyperfile::config::FlushConflictPolicy)
+    /// governs OCC behavior on the inode flush; with the default
+    /// `RetryLastWriterWins`, a concurrent compactor on the same directory
+    /// causes a refresh-and-retry. With `FailFast`, this method surfaces
+    /// `ErrorKind::AlreadyExists` so the caller can decide.
+    ///
+    /// If the scatter LIST is empty this method is a no-op (no flush, no
+    /// scatter delete) and returns `CompactStats { no_op: true, .. }`.
+    pub async fn compact(&mut self) -> Result<CompactStats> {
+        let changes = self.collect_scatter_changes().await?;
+        if changes.all_keys.is_empty() {
+            return Ok(CompactStats { no_op: true, ..Default::default() });
         }
 
-        // #5. read in all K/V from bmap to get latest view
-        // temp hash map to hold latest view of dir elements need to be load from staging
-        let mut map: HashMap<EntryNameHash, DirFileEntryRaw> = HashMap::new();
-        // final view of dir elements
-        let mut last_view_map: HashMap<EntryNameHash, DirFileEntryRaw> = HashMap::new();
+        let scatters_processed = changes.all_keys.len();
 
-        let opt_last_key = match self.bmap.last_key().await {
-            Ok(k) => { Some(k) },
-            Err(e) => {
-                if e.kind() != ErrorKind::NotFound {
-                    return Err(e);
-                }
-                None
-            },
-        };
-        // build temp map, bmap including dummy value
-        if let Some(last_key) = opt_last_key {
-            let mut n = 0;
-            while n <= last_key {
-                let key = self.bmap.seek_key(&n).await?;
-                let val = self.bmap.lookup(&key.clone()).await?;
-                map.insert(key, val);
-                if key > n {
-                    // n not found in bmap, reset n with key for next
-                    n = key;
-                } else {
-                    // if n == key, incr n for next
-                    n += 1;
-                }
+        let mut entries_added = 0;
+        for (hash, entry) in &changes.upserts {
+            let _ = self.bmap.insert(*hash, *entry).await?;
+            entries_added += 1;
+        }
+
+        let mut entries_removed = 0;
+        for hash in &changes.deletes {
+            match self.bmap.delete(hash).await {
+                Ok(_) => entries_removed += 1,
+                // Tombstone for a name that was never persisted (e.g., a file
+                // created and deleted before any compact ran). Idempotent.
+                Err(e) if e.kind() == ErrorKind::NotFound => {},
+                Err(e) => return Err(e),
             }
         }
 
-        // #6. build last view map
-        for (hashed_name, entry_raw) in map.into_iter() {
-            last_view_map.insert(hashed_name, entry_raw);
-        }
-        drop(v_transformed_scattered_inodes);
-
-        // #7. update bmap and flush
+        // hyperfile's flush handles OCC retry per FlushConflictPolicy.
         self.flush().await?;
 
-        // #8. cleanup
-        self.staging.remove_scatter_inodes(v_all_scatters_key).await?;
+        // Best-effort scatter cleanup. If this PUT batch fails, the next
+        // compact will see and re-process the same scatters; the bmap-side
+        // operations above are idempotent so re-application is safe.
+        self.staging.remove_scatter_inodes(changes.all_keys).await?;
 
-        // #9. build result
-        let v: Vec<DirFileEntry> = last_view_map.into_values().map(|raw| DirFileEntry::from_raw(&raw))
-                .collect();
-        Ok(v)
+        Ok(CompactStats {
+            scatters_processed,
+            entries_added,
+            entries_removed,
+            no_op: false,
+        })
+    }
+
+    /// List scatter, classify by op, fetch bodies for Create/Update.
+    ///
+    /// Pure read; both `read_dir` and `compact` start from this.
+    async fn collect_scatter_changes(&self) -> Result<ScatterChanges> {
+        let scatters = self.staging.list_scatter_inodes().await?;
+        let all_keys: Vec<String> = scatters.iter().map(|s| s.key.clone()).collect();
+
+        let last_view = DirScatterInode::filter_last_view(scatters);
+
+        let mut to_remove = Vec::new();
+        let mut to_fetch = Vec::new();
+        for s in last_view {
+            match s.op {
+                DirScatterInodeOp::Unknown => {
+                    warn!("scatter inode of unknown op: {}", s.key);
+                },
+                DirScatterInodeOp::PreDelete => {
+                    warn!("scatter inode of PreDelete (not yet implemented): {}", s.key);
+                },
+                DirScatterInodeOp::Delete => to_remove.push(s),
+                DirScatterInodeOp::Create | DirScatterInodeOp::Update => to_fetch.push(s),
+            }
+        }
+
+        let fetched = self.staging.collect_scatter_inodes(to_fetch).await?;
+        let mut upserts: HashMap<EntryNameHash, DirFileEntryRaw> = HashMap::new();
+        for (s, body) in fetched {
+            let hash = hash_filename(&s.filename);
+            let inode_raw = InodeRaw::from_u8_slice(&body);
+            let entry = DirFileEntryRaw::from(
+                &inode_raw,
+                <String as AsRef<OsStr>>::as_ref(&s.filename).as_encoded_bytes(),
+            );
+            upserts.insert(hash, entry);
+        }
+
+        let mut deletes: HashSet<EntryNameHash> = HashSet::new();
+        for s in to_remove {
+            deletes.insert(hash_filename(&s.filename));
+        }
+
+        Ok(ScatterChanges { all_keys, upserts, deletes })
+    }
+
+    /// Walk the persisted bmap read-only, returning the set of valid entries.
+    /// Skips dummy values inserted by hyperfile as bmap placeholders.
+    async fn walk_bmap_snapshot(&self) -> Result<HashMap<EntryNameHash, DirFileEntryRaw>> {
+        let mut map: HashMap<EntryNameHash, DirFileEntryRaw> = HashMap::new();
+        let opt_last_key = match self.bmap.last_key().await {
+            Ok(k) => Some(k),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(last_key) = opt_last_key {
+            let mut n: BlockIndex = 0;
+            loop {
+                let key = match self.bmap.seek_key(&n).await {
+                    Ok(k) => k,
+                    Err(e) if e.kind() == ErrorKind::NotFound => break,
+                    Err(e) => return Err(e),
+                };
+                if key > last_key {
+                    break;
+                }
+                let val = self.bmap.lookup(&key).await?;
+                if !val.is_dummy() {
+                    map.insert(key, val);
+                }
+                if key == BlockIndex::MAX {
+                    break;
+                }
+                n = key + 1;
+            }
+        }
+        Ok(map)
     }
 }
 
