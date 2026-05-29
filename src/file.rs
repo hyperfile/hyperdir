@@ -327,17 +327,34 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
 
     /// Consolidate outstanding scatter objects into the persisted bmap.
     ///
-    /// Lists scatter, applies Create/Update/Delete to the bmap, flushes the
-    /// directory's own hyperfile, and deletes the scatter objects. Hyperfile's
-    /// own [`FlushConflictPolicy`](hyperfile::config::FlushConflictPolicy)
-    /// governs OCC behavior on the inode flush; with the default
-    /// `RetryLastWriterWins`, a concurrent compactor on the same directory
-    /// causes a refresh-and-retry. With `FailFast`, this method surfaces
-    /// `ErrorKind::AlreadyExists` so the caller can decide.
+    /// Acquires the directory's compactor leader lease before doing any work
+    /// (see [`DirStaging::acquire_compact_lease`]). Concurrent callers on the
+    /// same directory will see `Err(ErrorKind::ResourceBusy)` returned fast,
+    /// rather than racing through the consolidate-and-flush path; correctness
+    /// also relies on hyperfile's inode-flush OCC, but the lease avoids the
+    /// duplicated I/O that OCC alone cannot.
+    ///
+    /// On a clean run the lease is released as soon as the consolidation
+    /// commits; on any error or panic, the lease will be reclaimed by the
+    /// next caller after [`DEFAULT_COMPACT_LEASE_TTL_MS`] passes.
     ///
     /// If the scatter LIST is empty this method is a no-op (no flush, no
     /// scatter delete) and returns `CompactStats { no_op: true, .. }`.
     pub async fn compact(&mut self) -> Result<CompactStats> {
+        let lease = self.staging
+            .acquire_compact_lease(crate::DEFAULT_COMPACT_LEASE_TTL_MS)
+            .await?;
+        let result = self.compact_inner().await;
+        // Always best-effort release, regardless of compact_inner's outcome.
+        // release_compact_lease itself only propagates errors that are not
+        // expected as a side effect of the lease's natural lifecycle.
+        let _ = self.staging.release_compact_lease(lease).await;
+        result
+    }
+
+    /// Body of [`compact`], assuming the caller has already acquired the
+    /// compactor lease for this directory.
+    async fn compact_inner(&mut self) -> Result<CompactStats> {
         let changes = self.collect_scatter_changes().await?;
         if changes.all_keys.is_empty() {
             return Ok(CompactStats { no_op: true, ..Default::default() });

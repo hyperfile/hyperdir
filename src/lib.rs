@@ -23,6 +23,93 @@ pub trait DirStaging {
     async fn emit_scatter_event(&self, buf: &[u8], op: DirScatterInodeOp) -> Result<()>;
     // get scatter inodes path
     fn scatter_inodes_path(&self) -> String;
+
+    /// Path of this directory's compactor lease object.
+    fn compact_lease_path(&self) -> String;
+
+    /// Try to acquire the leader lease for this directory's compactor.
+    ///
+    /// On success returns a guard whose `etag` is the conditional token to be
+    /// passed to [`release_compact_lease`]. If a fresh (non-expired) lease is
+    /// already held by another holder, returns `Err(ErrorKind::ResourceBusy)`
+    /// without writing or modifying anything in S3. If a lease is found but
+    /// has expired past `expires_at_unix_ms`, takes it over via `If-Match`.
+    async fn acquire_compact_lease(&self, ttl_ms: u64) -> Result<CompactLeaseGuard>;
+
+    /// Release a previously-acquired compactor lease.
+    ///
+    /// Best-effort: if the underlying object has been taken over by another
+    /// holder (we lost the race after our lease expired), the conditional
+    /// DELETE returns 412 and this method logs and returns `Ok(())`. Other
+    /// S3 errors are logged but not propagated, since a held lease will
+    /// expire naturally on TTL.
+    async fn release_compact_lease(&self, guard: CompactLeaseGuard) -> Result<()>;
+}
+
+/// Default TTL for the compactor leader lease. A compactor that holds the
+/// lease but crashes will block another compactor for at most this duration.
+pub const DEFAULT_COMPACT_LEASE_TTL_MS: u64 = 60_000;
+
+/// Object name (under each directory's prefix) used for the compactor lease.
+pub const DEFAULT_COMPACT_LEASE_FILE: &str = "_compact.lease";
+
+/// Handle to an acquired compactor lease. Pass back to
+/// [`DirStaging::release_compact_lease`] to relinquish it.
+///
+/// Holds no resources on its own; dropping this without calling
+/// `release_compact_lease` simply waits for the TTL to expire.
+#[derive(Debug, Clone)]
+pub struct CompactLeaseGuard {
+    /// Caller-side identifier of the lease holder (a fresh ULID per acquire).
+    /// Useful in logs to identify "who has the lease".
+    pub holder_id: String,
+    /// S3 ETag of the lease object as last written by us. The conditional
+    /// DELETE in `release_compact_lease` uses this so we don't release a
+    /// lease that has since been taken over.
+    pub etag: String,
+    /// Full S3 key of the lease object. Carried for debug logging.
+    pub lease_key: String,
+    /// Wall-clock expiration the lease was acquired with. Past this time, any
+    /// other client may take over the lease.
+    pub expires_at_unix_ms: i64,
+}
+
+/// Wire format for the lease object body. Two-line key=value, ASCII-only,
+/// no external dep. Robust enough for an object that is touched at most once
+/// per compaction round.
+pub(crate) fn format_lease_body(holder: &str, expires_at_unix_ms: i64) -> String {
+    format!("holder={}\nexpires_at_unix_ms={}\n", holder, expires_at_unix_ms)
+}
+
+pub(crate) fn parse_lease_body(buf: &[u8]) -> Result<(String, i64)> {
+    let s = std::str::from_utf8(buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("compact lease body not UTF-8: {}", e)))?;
+    let mut holder: Option<String> = None;
+    let mut expires_at: Option<i64> = None;
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("holder=") {
+            holder = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("expires_at_unix_ms=") {
+            expires_at = v.parse::<i64>().ok();
+        }
+    }
+    let holder = holder.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData,
+        "compact lease body missing 'holder='"))?;
+    let expires_at = expires_at.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData,
+        "compact lease body missing 'expires_at_unix_ms='"))?;
+    Ok((holder, expires_at))
+}
+
+/// Current Unix time in milliseconds. Saturates rather than wrapping; in the
+/// extremely unlikely case of a system clock past i64::MAX ms past epoch, the
+/// lease comparison will treat any held lease as expired (correct fallback).
+pub(crate) fn unix_now_ms() -> i64 {
+    use std::time::UNIX_EPOCH;
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 pub mod ondisk;
