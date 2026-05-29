@@ -53,6 +53,78 @@ pub const DEFAULT_COMPACT_LEASE_TTL_MS: u64 = 60_000;
 /// Object name (under each directory's prefix) used for the compactor lease.
 pub const DEFAULT_COMPACT_LEASE_FILE: &str = "_compact.lease";
 
+/// On-disk header carried in the body of a Delete (tombstone) scatter object.
+///
+/// Wire format of a Delete scatter body is:
+///
+/// ```text
+/// +------------------------+----------------------+
+/// | TombstoneHeader (16 B) | InodeRaw (~512 B)    |
+/// +------------------------+----------------------+
+/// ```
+///
+/// The `InodeRaw` portion is verbatim: the same bytes that hyperfile would
+/// have written to the file's own `<child>/inode` object. Preserving it
+/// means a future `fs_undelete` can rebuild the parent directory's bmap entry
+/// without having to re-read the (still-present) child prefix, and it keeps
+/// the audit trail "what exactly was deleted" inside the scatter object.
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy)]
+pub struct TombstoneHeader {
+    /// Wall-clock time the deletion was requested, in milliseconds since the
+    /// Unix epoch.
+    pub deleted_at_unix_ms: i64,
+    /// Earliest wall-clock time at which `fs_gc` is permitted to physically
+    /// reclaim the child file's prefix. A value of `0` means "no retention",
+    /// i.e. the next GC pass may immediately reclaim.
+    pub retention_until_unix_ms: i64,
+}
+
+impl TombstoneHeader {
+    pub const SIZE: usize = std::mem::size_of::<Self>();
+}
+
+/// Build the body of a Delete scatter: `TombstoneHeader` followed by the raw
+/// inode bytes captured from the child file at the moment of unlink.
+pub(crate) fn build_tombstone_body(
+    deleted_at_unix_ms: i64,
+    retention_until_unix_ms: i64,
+    inode_raw_bytes: &[u8],
+) -> Vec<u8> {
+    let header = TombstoneHeader { deleted_at_unix_ms, retention_until_unix_ms };
+    // Safety: `header` is a `#[repr(C)]` plain-old-data struct of fixed size,
+    // and the slice is read-only and lifetime-bounded to this scope.
+    let header_bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&header as *const TombstoneHeader) as *const u8,
+            TombstoneHeader::SIZE,
+        )
+    };
+    let mut body = Vec::with_capacity(TombstoneHeader::SIZE + inode_raw_bytes.len());
+    body.extend_from_slice(header_bytes);
+    body.extend_from_slice(inode_raw_bytes);
+    body
+}
+
+/// Parse a tombstone scatter body into its header and the trailing inode
+/// payload. Returns the inode bytes by reference into `buf`; callers that
+/// need to keep them past `buf`'s lifetime must copy.
+pub(crate) fn parse_tombstone_body(buf: &[u8]) -> Result<(TombstoneHeader, &[u8])> {
+    if buf.len() < TombstoneHeader::SIZE {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("tombstone body too small: {} < {} bytes",
+                    buf.len(), TombstoneHeader::SIZE)));
+    }
+    let (header_bytes, rest) = buf.split_at(TombstoneHeader::SIZE);
+    // Safety: `header_bytes.len() == TombstoneHeader::SIZE` and the struct is
+    // `#[repr(C, align(8))]` with no internal references; reading it from a
+    // byte slice this way is well-defined as long as the slice is properly
+    // aligned. We copy by value into the local `header` so subsequent reads
+    // off `buf` don't alias.
+    let header = unsafe { std::ptr::read_unaligned(header_bytes.as_ptr() as *const TombstoneHeader) };
+    Ok((header, rest))
+}
+
 /// Handle to an acquired compactor lease. Pass back to
 /// [`DirStaging::release_compact_lease`] to relinquish it.
 ///
@@ -121,6 +193,7 @@ pub mod interceptor;
 
 pub use interceptor::ScatterFirstInterceptor;
 pub use file::CompactStats;
+pub use fs::GcStats;
 
 pub const DEFAULT_DIR_INODE_SCATTER_FOLDER: &str = "!";
 pub const DEFAULT_DIR_INODE_MARKER: &str = "inode_";
