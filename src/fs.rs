@@ -593,45 +593,35 @@ impl<'a> HyperDir<'a>
         debug!("fs_rename_across - {}/{} -> {}/{}",
                src_parent_uuid, src_name, dst_parent_uuid, dst_name);
 
-        // Read the source entry (inode + uuid) and check the destination is
-        // free, both before committing.
-        let src = Self::fs_open_dir(client, layout, bucket, src_parent_uuid, FileFlags::rdonly()).await?;
-        let entry_raw = src.inner.read_entry_raw(src_name).await?;
-        drop(src);
-
-        let dst = Self::fs_open_dir(client, layout, bucket, dst_parent_uuid, FileFlags::rdonly()).await?;
-        if dst.inner.read_entry(dst_name).await.is_ok() {
-            return Err(Error::new(ErrorKind::AlreadyExists,
-                format!("rename target exists: {}/{}", dst_parent_uuid, dst_name)));
-        }
-        drop(dst);
-
-        let intent = RenameIntent {
-            src_parent: *src_parent_uuid,
-            src_name: src_name.to_string(),
-            dst_parent: *dst_parent_uuid,
-            dst_name: dst_name.to_string(),
-            child: Uuid::from_bytes(entry_raw.uuid),
-            inode: entry_raw.inode.as_u8_slice().to_vec(),
-        };
-
-        // Commit point: a unique intent object.
-        let txn_id = Ulid::new().to_string();
-        let key = layout.txn_key(&txn_id);
-        client.put_object()
-            .bucket(bucket)
-            .key(&key)
-            .body(SdkBody::from(intent.serialize().as_bytes()).into())
-            .if_none_match('*')
-            .send()
-            .await
-            .map_err(|e| Error::other(format!("PutObject intent s3://{}/{}: {}", bucket, key, e)))?;
+        let (key, intent) = emit_rename_intent(
+            client, layout, bucket, src_parent_uuid, src_name, dst_parent_uuid, dst_name).await?;
 
         apply_rename_intent(client, layout, bucket, &intent).await?;
 
         // Best-effort intent cleanup; a leftover intent is harmless and will
         // be re-applied (idempotently) and removed by fs_recover_renames.
         let _ = delete_object(client, bucket, &key).await;
+        Ok(())
+    }
+
+    /// Test-only: perform a cross-directory rename's pre-checks and write the
+    /// commit-point intent object, then return WITHOUT applying it -- i.e.
+    /// simulate a crash immediately after the commit. A subsequent
+    /// [`fs_recover_renames`] must complete the move.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fs_rename_emit_intent_only(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+        src_parent_uuid: &Uuid,
+        src_name: &str,
+        dst_parent_uuid: &Uuid,
+        dst_name: &str,
+    ) -> Result<()>
+    {
+        let _ = emit_rename_intent(
+            client, layout, bucket, src_parent_uuid, src_name, dst_parent_uuid, dst_name).await?;
         Ok(())
     }
 
@@ -759,6 +749,53 @@ impl RenameIntent {
             inode: inode.ok_or_else(|| Error::new(ErrorKind::InvalidData, "intent missing inode"))?,
         })
     }
+}
+
+/// Pre-check a cross-directory rename and write its commit-point intent
+/// object (`If-None-Match: *`), returning the intent's S3 key and the parsed
+/// intent. Source must exist (`NotFound`); destination must not
+/// (`AlreadyExists`). Shared by `fs_rename_across` and the crash-injection
+/// test entry.
+async fn emit_rename_intent(
+    client: &Client,
+    layout: &HyperDirLayout,
+    bucket: &str,
+    src_parent_uuid: &Uuid,
+    src_name: &str,
+    dst_parent_uuid: &Uuid,
+    dst_name: &str,
+) -> Result<(String, RenameIntent)> {
+    let src = HyperDir::fs_open_dir(client, layout, bucket, src_parent_uuid, FileFlags::rdonly()).await?;
+    let entry_raw = src.inner.read_entry_raw(src_name).await?;
+    drop(src);
+
+    let dst = HyperDir::fs_open_dir(client, layout, bucket, dst_parent_uuid, FileFlags::rdonly()).await?;
+    if dst.inner.read_entry(dst_name).await.is_ok() {
+        return Err(Error::new(ErrorKind::AlreadyExists,
+            format!("rename target exists: {}/{}", dst_parent_uuid, dst_name)));
+    }
+    drop(dst);
+
+    let intent = RenameIntent {
+        src_parent: *src_parent_uuid,
+        src_name: src_name.to_string(),
+        dst_parent: *dst_parent_uuid,
+        dst_name: dst_name.to_string(),
+        child: Uuid::from_bytes(entry_raw.uuid),
+        inode: entry_raw.inode.as_u8_slice().to_vec(),
+    };
+
+    let txn_id = Ulid::new().to_string();
+    let key = layout.txn_key(&txn_id);
+    client.put_object()
+        .bucket(bucket)
+        .key(&key)
+        .body(SdkBody::from(intent.serialize().as_bytes()).into())
+        .if_none_match('*')
+        .send()
+        .await
+        .map_err(|e| Error::other(format!("PutObject intent s3://{}/{}: {}", bucket, key, e)))?;
+    Ok((key, intent))
 }
 
 /// Forward-apply a committed rename intent: add the entry to the destination
