@@ -323,6 +323,30 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         }
     }
 
+    /// Look up the raw on-disk entry (inode + uuid + name) by name. Used by
+    /// cross-directory rename to move an entry verbatim.
+    pub async fn read_entry_raw(&self, name: &str) -> Result<DirFileEntryRaw> {
+        let home = hash_filename(name);
+        match self.probe_lookup(name.as_bytes(), home).await? {
+            Some((_, entry)) => Ok(entry),
+            None => Err(Error::new(ErrorKind::NotFound, format!("entry not found: {}", name))),
+        }
+    }
+
+    /// Insert/update an entry under `name` and flush. Idempotent.
+    pub async fn insert_entry(&mut self, name: &str, entry: DirFileEntryRaw) -> Result<()> {
+        self.probe_upsert(name.as_bytes(), entry).await?;
+        self.flush().await?;
+        Ok(())
+    }
+
+    /// Remove the entry named `name` and flush. Returns false if absent.
+    pub async fn remove_entry(&mut self, name: &str) -> Result<bool> {
+        let removed = self.probe_delete(name.as_bytes()).await?;
+        self.flush().await?;
+        Ok(removed)
+    }
+
     /// Pure-read directory enumeration.
     ///
     /// Lists outstanding scatter objects, walks the persisted bmap, and merges

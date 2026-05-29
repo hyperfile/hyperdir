@@ -2,7 +2,10 @@ use std::io::{Result, Error, ErrorKind};
 use std::time::Duration;
 use log::{debug, warn};
 use uuid::Uuid;
+use ulid::Ulid;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::primitives::SdkBody;
 use hyperfile::file::flags::{FileFlags, HyperFileFlags};
 use hyperfile::file::mode::{FileMode, HyperFileMode};
 use hyperfile::config::HyperFileConfigBuilder;
@@ -474,6 +477,119 @@ impl<'a> HyperDir<'a>
         debug!("fs_rename - {} -> {}", old_name, new_name);
         self.inner.rename_within(old_name, new_name).await
     }
+
+    /// Rename a child across two different directories.
+    ///
+    /// The child keeps its UUID and storage; only the two parents' mappings
+    /// change. Because the two parent inode flushes cannot be made atomic
+    /// together, a rename intent object is written first as the single commit
+    /// point: once it exists the rename is logically committed and is
+    /// completed forward (add to destination, remove from source) idempotently,
+    /// then the intent is deleted. A crash at any point leaves the intent
+    /// behind for [`fs_recover_renames`] to finish.
+    ///
+    /// Source must exist (`NotFound`) and destination must not
+    /// (`AlreadyExists`); both are checked before the commit. The pre-checks
+    /// and the commit are not atomic, so a destination created concurrently
+    /// between the check and the apply can be overwritten (a higher-layer
+    /// concern).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fs_rename_across(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+        src_parent_uuid: &Uuid,
+        src_name: &str,
+        dst_parent_uuid: &Uuid,
+        dst_name: &str,
+    ) -> Result<()>
+    {
+        debug!("fs_rename_across - {}/{} -> {}/{}",
+               src_parent_uuid, src_name, dst_parent_uuid, dst_name);
+
+        // Read the source entry (inode + uuid) and check the destination is
+        // free, both before committing.
+        let src = Self::fs_open_dir_uuid(client, layout, bucket, src_parent_uuid, FileFlags::rdonly()).await?;
+        let entry_raw = src.inner.read_entry_raw(src_name).await?;
+        drop(src);
+
+        let dst = Self::fs_open_dir_uuid(client, layout, bucket, dst_parent_uuid, FileFlags::rdonly()).await?;
+        if dst.inner.read_entry(dst_name).await.is_ok() {
+            return Err(Error::new(ErrorKind::AlreadyExists,
+                format!("rename target exists: {}/{}", dst_parent_uuid, dst_name)));
+        }
+        drop(dst);
+
+        let intent = RenameIntent {
+            src_parent: *src_parent_uuid,
+            src_name: src_name.to_string(),
+            dst_parent: *dst_parent_uuid,
+            dst_name: dst_name.to_string(),
+            child: Uuid::from_bytes(entry_raw.uuid),
+            inode: entry_raw.inode.as_u8_slice().to_vec(),
+        };
+
+        // Commit point: a unique intent object.
+        let txn_id = Ulid::new().to_string();
+        let key = layout.txn_key(&txn_id);
+        client.put_object()
+            .bucket(bucket)
+            .key(&key)
+            .body(SdkBody::from(intent.serialize().as_bytes()).into())
+            .if_none_match('*')
+            .send()
+            .await
+            .map_err(|e| Error::other(format!("PutObject intent s3://{}/{}: {}", bucket, key, e)))?;
+
+        apply_rename_intent(client, layout, bucket, &intent).await?;
+
+        // Best-effort intent cleanup; a leftover intent is harmless and will
+        // be re-applied (idempotently) and removed by fs_recover_renames.
+        let _ = delete_object(client, bucket, &key).await;
+        Ok(())
+    }
+
+    /// Re-drive any rename intents left behind by an interrupted
+    /// [`fs_rename_across`] (e.g. a crash between the commit and the intent
+    /// delete). Each intent's forward steps are idempotent, so re-applying a
+    /// fully-completed rename is a no-op.
+    pub async fn fs_recover_renames(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+    ) -> Result<usize>
+    {
+        let prefix = layout.txn_prefix();
+        debug!("fs_recover_renames - prefix: {}", prefix);
+        let mut recovered = 0;
+        let mut stream = client.list_objects_v2()
+            .bucket(bucket)
+            .prefix(&prefix)
+            .into_paginator()
+            .send();
+        while let Some(page) = stream.next().await {
+            let page = page.map_err(|e| Error::other(format!("ListObjectsV2 {}: {}", prefix, e)))?;
+            if let Some(objects) = page.contents {
+                for obj in objects.iter() {
+                    let Some(key) = obj.key() else { continue };
+                    if !key.ends_with(".intent") { continue; }
+                    let body = get_object_raw(client, bucket, key).await?;
+                    let intent = match RenameIntent::parse(&body) {
+                        Ok(i) => i,
+                        Err(e) => { warn!("fs_recover_renames: bad intent {}: {}", key, e); continue; }
+                    };
+                    apply_rename_intent(client, layout, bucket, &intent).await?;
+                    delete_object(client, bucket, key).await?;
+                    recovered += 1;
+                }
+            }
+        }
+        Ok(recovered)
+    }
+
+    async fn fs_open_dir_uuid(client: &Client, layout: &HyperDirLayout, bucket: &str, uuid: &Uuid, flags: FileFlags) -> Result<Self> {
+        Self::fs_open(client, &layout.dir_uri(bucket, uuid), flags).await
+    }
 }
 
 /// Statistics returned from [`HyperDir::fs_gc`].
@@ -491,6 +607,105 @@ pub struct GcStats {
     /// malformed body, etc.). These are left in S3 and a subsequent `fs_gc`
     /// call may retry them. The detailed reason is in the log at `warn` level.
     pub errors: usize,
+}
+
+/// A cross-directory rename, captured durably so the move can be completed
+/// (or recovered) after the single intent-object commit.
+struct RenameIntent {
+    src_parent: Uuid,
+    src_name: String,
+    dst_parent: Uuid,
+    dst_name: String,
+    /// The child's UUID; preserved across the move (its storage never moves).
+    child: Uuid,
+    /// The source entry's raw inode bytes, moved verbatim to the destination.
+    inode: Vec<u8>,
+}
+
+impl RenameIntent {
+    /// key=value text body; names and inode are base64 (values are otherwise
+    /// arbitrary bytes). Mirrors the lease body's no-dependency style.
+    fn serialize(&self) -> String {
+        format!(
+            "src_parent={}\nsrc_name={}\ndst_parent={}\ndst_name={}\nchild={}\ninode={}\n",
+            self.src_parent,
+            B64.encode(self.src_name.as_bytes()),
+            self.dst_parent,
+            B64.encode(self.dst_name.as_bytes()),
+            self.child,
+            B64.encode(&self.inode),
+        )
+    }
+
+    fn parse(buf: &[u8]) -> Result<Self> {
+        let s = std::str::from_utf8(buf)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("intent not UTF-8: {}", e)))?;
+        let mut src_parent = None;
+        let mut src_name = None;
+        let mut dst_parent = None;
+        let mut dst_name = None;
+        let mut child = None;
+        let mut inode = None;
+        let b64s = |v: &str| -> Result<String> {
+            let bytes = B64.decode(v).map_err(|e| Error::new(ErrorKind::InvalidData, format!("intent b64: {}", e)))?;
+            String::from_utf8(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, format!("intent name: {}", e)))
+        };
+        let uuid = |v: &str| -> Result<Uuid> {
+            Uuid::parse_str(v).map_err(|e| Error::new(ErrorKind::InvalidData, format!("intent uuid: {}", e)))
+        };
+        for line in s.lines() {
+            if let Some(v) = line.strip_prefix("src_parent=") { src_parent = Some(uuid(v)?); }
+            else if let Some(v) = line.strip_prefix("src_name=") { src_name = Some(b64s(v)?); }
+            else if let Some(v) = line.strip_prefix("dst_parent=") { dst_parent = Some(uuid(v)?); }
+            else if let Some(v) = line.strip_prefix("dst_name=") { dst_name = Some(b64s(v)?); }
+            else if let Some(v) = line.strip_prefix("child=") { child = Some(uuid(v)?); }
+            else if let Some(v) = line.strip_prefix("inode=") {
+                inode = Some(B64.decode(v).map_err(|e| Error::new(ErrorKind::InvalidData, format!("intent inode b64: {}", e)))?);
+            }
+        }
+        Ok(Self {
+            src_parent: src_parent.ok_or_else(|| Error::new(ErrorKind::InvalidData, "intent missing src_parent"))?,
+            src_name: src_name.ok_or_else(|| Error::new(ErrorKind::InvalidData, "intent missing src_name"))?,
+            dst_parent: dst_parent.ok_or_else(|| Error::new(ErrorKind::InvalidData, "intent missing dst_parent"))?,
+            dst_name: dst_name.ok_or_else(|| Error::new(ErrorKind::InvalidData, "intent missing dst_name"))?,
+            child: child.ok_or_else(|| Error::new(ErrorKind::InvalidData, "intent missing child"))?,
+            inode: inode.ok_or_else(|| Error::new(ErrorKind::InvalidData, "intent missing inode"))?,
+        })
+    }
+}
+
+/// Forward-apply a committed rename intent: add the entry to the destination
+/// directory, then remove it from the source. Both steps are idempotent, so
+/// this is safe to re-run during recovery. Destination-add happens first so
+/// the child is never unreachable by name mid-rename.
+async fn apply_rename_intent(client: &Client, layout: &HyperDirLayout, bucket: &str, intent: &RenameIntent) -> Result<()> {
+    let inode_raw = InodeRaw::from_u8_slice(&intent.inode);
+    let entry = crate::ondisk::DirFileEntryRaw::from(&inode_raw, intent.child.as_bytes(), intent.dst_name.as_bytes());
+
+    let mut dst = HyperDir::fs_open_dir_uuid(client, layout, bucket, &intent.dst_parent, FileFlags::rdwr()).await?;
+    dst.inner.insert_entry(&intent.dst_name, entry).await?;
+    drop(dst);
+
+    let mut src = HyperDir::fs_open_dir_uuid(client, layout, bucket, &intent.src_parent, FileFlags::rdwr()).await?;
+    let _ = src.inner.remove_entry(&intent.src_name).await?;
+    Ok(())
+}
+
+/// GET an object's raw bytes by key.
+async fn get_object_raw(client: &Client, bucket: &str, key: &str) -> Result<bytes::Bytes> {
+    let res = client.get_object().bucket(bucket).key(key).send().await
+        .map_err(|e| Error::other(format!("GetObject s3://{}/{}: {}", bucket, key, e)))?;
+    let bytes = res.body.collect().await
+        .map_err(|e| Error::other(format!("collect body s3://{}/{}: {}", bucket, key, e)))?
+        .into_bytes();
+    Ok(bytes)
+}
+
+/// DELETE an object by key.
+async fn delete_object(client: &Client, bucket: &str, key: &str) -> Result<()> {
+    client.delete_object().bucket(bucket).key(key).send().await
+        .map_err(|e| Error::other(format!("DeleteObject s3://{}/{}: {}", bucket, key, e)))?;
+    Ok(())
 }
 
 /// True if a Unix mode word denotes a directory (`S_IFDIR`).

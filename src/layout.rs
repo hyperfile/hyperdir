@@ -30,6 +30,7 @@ pub const ROOT_DIR_UUID: Uuid = Uuid::nil();
 
 const DIR_NAMESPACE: &str = "DIR";
 const FILE_NAMESPACE: &str = "FILE";
+const TXN_NAMESPACE: &str = "_TXN";
 
 /// Builds the S3 keys / URIs for directories and files in a single tree.
 #[derive(Debug, Clone, Default)]
@@ -80,6 +81,16 @@ impl HyperDirLayout {
     /// Full `s3://` URI of the root directory's prefix.
     pub fn root_dir_uri(&self, bucket: &str) -> String {
         self.dir_uri(bucket, &ROOT_DIR_UUID)
+    }
+
+    /// Key of a cross-directory rename intent object, identified by `txn_id`.
+    pub fn txn_key(&self, txn_id: &str) -> String {
+        format!("{}{TXN_NAMESPACE}/{}.intent", self.base, txn_id)
+    }
+
+    /// LIST prefix covering all rename intent objects.
+    pub fn txn_prefix(&self) -> String {
+        format!("{}{TXN_NAMESPACE}/", self.base)
     }
 }
 
