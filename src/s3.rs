@@ -8,7 +8,8 @@ use aws_sdk_s3::primitives::SdkBody;
 use hyperfile::staging::config::StagingConfig;
 use hyperfile::staging::s3::S3Staging;
 use super::{DirStaging, DirScatterInode, DirScatterInodeOp, CompactLeaseGuard};
-use super::{DEFAULT_DIR_INODE_MARKER, DEFAULT_DIR_INODE_SCATTER_FOLDER, DEFAULT_COMPACT_LEASE_FILE};
+use super::{DEFAULT_DIR_INODE_SCATTER_FOLDER, DEFAULT_COMPACT_LEASE_FILE};
+use super::{DEFAULT_DIR_INODE_SUFFIX, DEFAULT_DIR_TOMBSTONE_SUFFIX};
 use super::{format_lease_body, parse_lease_body, unix_now_ms};
 
 impl DirStaging for S3Staging {
@@ -27,7 +28,9 @@ impl DirStaging for S3Staging {
                 if let Some(objects) = list_res.contents {
                     for obj in objects.iter() {
                         if let Some(key) = obj.key() {
-                            if key.contains(DEFAULT_DIR_INODE_MARKER) {
+                            if key.ends_with(DEFAULT_DIR_INODE_SUFFIX)
+                                || key.ends_with(DEFAULT_DIR_TOMBSTONE_SUFFIX)
+                            {
                                 let st = SystemTime::try_from(
                                     obj.last_modified.expect("unable to get last_modified from object")
                                 ).expect("unable to convert DateTime to SystemTime");
