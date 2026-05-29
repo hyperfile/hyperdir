@@ -20,9 +20,13 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.22.1"
 crc64fast = "1.1.0"
 aws-sdk-s3 = "1.85.0"
-btree-ondisk = { version = "0.18", default-features = false }
+btree-ondisk = { version = "0.18.1", default-features = false }
 hyperfile = { version = "0.3", default-features = false }
 
 [features]
 default = ["hyperfile/blocking", "hyperfile/meta_loader_batch"]
 wal = ["hyperfile/wal"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }

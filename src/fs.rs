@@ -267,7 +267,7 @@ impl<'a> HyperDir<'a>
         let child_uri = layout.file_uri(bucket, target_file_uuid);
         debug!("fs_link - parent: {}, name: {}, target: {}", parent_dir_uuid, new_name, child_uri);
 
-        let mut parent = Self::fs_open_dir_uuid(client, layout, bucket, parent_dir_uuid, FileFlags::rdwr()).await?;
+        let mut parent = Self::fs_open_dir(client, layout, bucket, parent_dir_uuid, FileFlags::rdwr()).await?;
         if parent.inner.read_entry(new_name).await.is_ok() {
             return Err(Error::new(ErrorKind::AlreadyExists,
                 format!("link target name exists: {}/{}", parent_dir_uuid, new_name)));
@@ -595,11 +595,11 @@ impl<'a> HyperDir<'a>
 
         // Read the source entry (inode + uuid) and check the destination is
         // free, both before committing.
-        let src = Self::fs_open_dir_uuid(client, layout, bucket, src_parent_uuid, FileFlags::rdonly()).await?;
+        let src = Self::fs_open_dir(client, layout, bucket, src_parent_uuid, FileFlags::rdonly()).await?;
         let entry_raw = src.inner.read_entry_raw(src_name).await?;
         drop(src);
 
-        let dst = Self::fs_open_dir_uuid(client, layout, bucket, dst_parent_uuid, FileFlags::rdonly()).await?;
+        let dst = Self::fs_open_dir(client, layout, bucket, dst_parent_uuid, FileFlags::rdonly()).await?;
         if dst.inner.read_entry(dst_name).await.is_ok() {
             return Err(Error::new(ErrorKind::AlreadyExists,
                 format!("rename target exists: {}/{}", dst_parent_uuid, dst_name)));
@@ -673,7 +673,8 @@ impl<'a> HyperDir<'a>
         Ok(recovered)
     }
 
-    async fn fs_open_dir_uuid(client: &Client, layout: &HyperDirLayout, bucket: &str, uuid: &Uuid, flags: FileFlags) -> Result<Self> {
+    /// Open a directory by its UUID.
+    pub async fn fs_open_dir(client: &Client, layout: &HyperDirLayout, bucket: &str, uuid: &Uuid, flags: FileFlags) -> Result<Self> {
         Self::fs_open(client, &layout.dir_uri(bucket, uuid), flags).await
     }
 }
@@ -768,11 +769,11 @@ async fn apply_rename_intent(client: &Client, layout: &HyperDirLayout, bucket: &
     let inode_raw = InodeRaw::from_u8_slice(&intent.inode);
     let entry = crate::ondisk::DirFileEntryRaw::from(&inode_raw, intent.child.as_bytes(), intent.dst_name.as_bytes());
 
-    let mut dst = HyperDir::fs_open_dir_uuid(client, layout, bucket, &intent.dst_parent, FileFlags::rdwr()).await?;
+    let mut dst = HyperDir::fs_open_dir(client, layout, bucket, &intent.dst_parent, FileFlags::rdwr()).await?;
     dst.inner.insert_entry(&intent.dst_name, entry).await?;
     drop(dst);
 
-    let mut src = HyperDir::fs_open_dir_uuid(client, layout, bucket, &intent.src_parent, FileFlags::rdwr()).await?;
+    let mut src = HyperDir::fs_open_dir(client, layout, bucket, &intent.src_parent, FileFlags::rdwr()).await?;
     let _ = src.inner.remove_entry(&intent.src_name).await?;
     Ok(())
 }
