@@ -198,11 +198,13 @@ pub mod hyper;
 pub mod fs;
 pub mod interceptor;
 pub mod layout;
+pub mod lock;
 
 pub use interceptor::ScatterFirstInterceptor;
 pub use file::CompactStats;
 pub use fs::GcStats;
 pub use layout::{HyperDirLayout, ROOT_DIR_UUID};
+pub use lock::{LockKind, Conflict, SetLkOutcome, DEFAULT_LOCK_TTL_MS};
 
 pub const DEFAULT_DIR_INODE_SCATTER_FOLDER: &str = "!";
 /// Suffix of a live (Create/Update) inode scatter object.
