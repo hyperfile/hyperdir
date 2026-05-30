@@ -637,6 +637,14 @@ impl<'a> HyperDir<'a>
         self.inner.read_entry(name).await
     }
 
+    /// Scatter-aware single-name resolve (the cheap lookup path): see
+    /// [`HyperDirFile::resolve_entry`]. Returns `None` if the name is absent.
+    pub async fn fs_resolve_entry(&self, name: &str) -> Result<Option<DirFileEntry>>
+    {
+        debug!("fs_resolve_entry - name: {}", name);
+        self.inner.resolve_entry(name).await
+    }
+
     pub async fn fs_read_dir(&self) -> Result<Vec<DirFileEntry>>
     {
         debug!("fs_readdir - ");

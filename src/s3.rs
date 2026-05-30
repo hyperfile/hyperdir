@@ -12,36 +12,47 @@ use super::{DEFAULT_DIR_INODE_SCATTER_FOLDER, DEFAULT_COMPACT_LEASE_FILE};
 use super::{DEFAULT_DIR_INODE_SUFFIX, DEFAULT_DIR_TOMBSTONE_SUFFIX};
 use super::{format_lease_body, parse_lease_body, unix_now_ms};
 
-impl DirStaging for S3Staging {
-    async fn list_scatter_inodes(&self) -> Result<Vec<DirScatterInode>> {
-        let scatter_inodes_path = self.scatter_inodes_path();
-        let mut stream = self.client.list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(&scatter_inodes_path)
-            .delimiter("/")
-            .into_paginator()
-            .send();
-
-        let mut scatters = Vec::new();
-        while let Some(page) = stream.next().await {
-            if let Ok(list_res) = page {
-                if let Some(objects) = list_res.contents {
-                    for obj in objects.iter() {
-                        if let Some(key) = obj.key() {
-                            if key.ends_with(DEFAULT_DIR_INODE_SUFFIX)
-                                || key.ends_with(DEFAULT_DIR_TOMBSTONE_SUFFIX)
-                            {
-                                let st = SystemTime::try_from(
-                                    obj.last_modified.expect("unable to get last_modified from object")
-                                ).expect("unable to convert DateTime to SystemTime");
-                                scatters.push(DirScatterInode::path_decode(key, st));
-                            }
+/// List every scatter object under `prefix` (recursive — no delimiter — so it
+/// covers the per-name `{base64}/` subfolders) and decode them.
+async fn list_scatter_with_prefix(client: &aws_sdk_s3::Client, bucket: &str, prefix: &str)
+    -> std::io::Result<Vec<DirScatterInode>>
+{
+    let mut stream = client.list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .into_paginator()
+        .send();
+    let mut scatters = Vec::new();
+    while let Some(page) = stream.next().await {
+        if let Ok(list_res) = page {
+            if let Some(objects) = list_res.contents {
+                for obj in objects.iter() {
+                    if let Some(key) = obj.key() {
+                        if key.ends_with(DEFAULT_DIR_INODE_SUFFIX)
+                            || key.ends_with(DEFAULT_DIR_TOMBSTONE_SUFFIX)
+                        {
+                            let st = SystemTime::try_from(
+                                obj.last_modified.expect("unable to get last_modified from object")
+                            ).expect("unable to convert DateTime to SystemTime");
+                            scatters.push(DirScatterInode::path_decode(key, st));
                         }
                     }
                 }
             }
         }
-        Ok(scatters)
+    }
+    Ok(scatters)
+}
+
+impl DirStaging for S3Staging {
+    async fn list_scatter_inodes(&self) -> Result<Vec<DirScatterInode>> {
+        list_scatter_with_prefix(&self.client, &self.bucket, &self.scatter_inodes_path()).await
+    }
+
+    async fn list_scatter_inodes_for_name(&self, filename: &str) -> Result<Vec<DirScatterInode>> {
+        // Scoped to one name's subfolder: `!/{base64(name)}/`.
+        let prefix = format!("{}{}/", self.scatter_inodes_path(), DirScatterInode::encode_filename(filename));
+        list_scatter_with_prefix(&self.client, &self.bucket, &prefix).await
     }
 
     async fn collect_scatter_inodes(&self, v_scatters: Vec<DirScatterInode>) -> Result<Vec<(DirScatterInode, Bytes)>> {

@@ -12,6 +12,9 @@ use hyperfile::staging::config::StagingConfig;
 pub trait DirStaging {
     // list dir staging and filter out all inode object, return vec of scatter inodes
     async fn list_scatter_inodes(&self) -> Result<Vec<DirScatterInode>>;
+    // list only the scatter objects for a single filename (scoped LIST under
+    // `!/{base64(name)}/`); 0..N depending on the name's pending history.
+    async fn list_scatter_inodes_for_name(&self, filename: &str) -> Result<Vec<DirScatterInode>>;
     // fetch inodes, return vec of (scatter, inode raw)
     async fn collect_scatter_inodes(&self, v_scatters: Vec<DirScatterInode>) -> Result<Vec<(DirScatterInode, Bytes)>>;
     // remove list of inode object on dir staging
@@ -240,7 +243,11 @@ pub struct DirScatterInode {
 }
 
 /// Scatter Inode Format:
-/// `<parent dir key>/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/{ulid}_{base64(filename)}_{uuid}_{op}{suffix}`
+/// `<parent dir key>/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/{base64(filename)}/{ulid}_{uuid}_{op}{suffix}`
+///
+/// The base64(filename) is its own path segment so a single name's scatter
+/// objects can be listed with `LIST prefix=<dir>/!/{base64(name)}/` (which may
+/// return any number, including zero, across a create/delete/... history).
 ///
 /// `suffix` is `.tombstone` for a Delete op and `.inode` for everything else,
 /// so live entries and tombstones can be filtered by object suffix alone.
@@ -257,18 +264,17 @@ impl DirScatterInode {
 
         let key = scatter_inode.to_owned();
 
-        // components[1] = "/{ulid}_{base64(name)}_{uuid}_{op}{suffix}"
+        // components[1] = "/{base64(name)}/{ulid}_{uuid}_{op}{suffix}"
         let stem = components[1]
             .trim_start_matches('/')
             .strip_suffix(DEFAULT_DIR_INODE_SUFFIX)
             .or_else(|| components[1].trim_start_matches('/').strip_suffix(DEFAULT_DIR_TOMBSTONE_SUFFIX))
             .expect("scatter object missing .inode/.tombstone suffix");
 
-        // "{ulid}_{base64(name)}_{uuid}_{op}" split on '_':
-        //   [ ulid, base64(name), uuid, op ]
-        // base64 uses an alphabet of [*-A-Za-z0-9] (no '_') and the uuid is
-        // hyphenated (no '_'), so '_' is an unambiguous separator.
-        let parts: Vec<&str> = stem.split('_').collect();
+        // "{base64(name)}/{ulid}_{uuid}_{op}": the name is its own segment
+        // (base64 has no '/'), then '_'-separated ulid/uuid/op.
+        let (b64name, rest) = stem.split_once('/').expect("scatter object missing name segment");
+        let parts: Vec<&str> = rest.split('_').collect();
 
         let ulid = Ulid::from_string(parts[0]).expect("failed to decode ulid from event path");
 
@@ -276,12 +282,12 @@ impl DirScatterInode {
         let crazy_config = engine::GeneralPurposeConfig::new()
             .with_decode_padding_mode(engine::DecodePaddingMode::RequireNone);
         let crazy_engine = engine::GeneralPurpose::new(&alphabet, crazy_config);
-        let decoded = crazy_engine.decode(parts[1]).expect("failed to decode filename from event path");
+        let decoded = crazy_engine.decode(b64name).expect("failed to decode filename from event path");
         let filename = String::from_utf8(decoded).expect("failed to get back string of filename");
 
-        let uuid = Uuid::parse_str(parts[2]).expect("failed to decode uuid from event path");
+        let uuid = Uuid::parse_str(parts[1]).expect("failed to decode uuid from event path");
 
-        let op_u8 = u8::from_str(parts[3]).expect("failed to decode DirScatterInodeOp from event path ");
+        let op_u8 = u8::from_str(parts[2]).expect("failed to decode DirScatterInodeOp from event path ");
         let op = DirScatterInodeOp::from_u8(op_u8);
 
         Self { key, op, ulid, uuid, filename, last_modified }
@@ -290,12 +296,7 @@ impl DirScatterInode {
     pub fn path_encode(dir_staging_path: &str, filename: &str, uuid: &Uuid, op: u8) -> String {
         assert!(!dir_staging_path.ends_with("/"));
         let ulid = Ulid::new().to_string();
-
-        let alphabet = alphabet::Alphabet::new("*-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789").unwrap();
-        let crazy_config = engine::GeneralPurposeConfig::new()
-            .with_encode_padding(false);
-        let crazy_engine = engine::GeneralPurpose::new(&alphabet, crazy_config);
-        let encoded_filename = crazy_engine.encode(filename);
+        let encoded_filename = Self::encode_filename(filename);
 
         let suffix = if op == DirScatterInodeOp::Delete as u8 {
             DEFAULT_DIR_TOMBSTONE_SUFFIX
@@ -303,7 +304,19 @@ impl DirScatterInode {
             DEFAULT_DIR_INODE_SUFFIX
         };
 
-        format!("{dir_staging_path}/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/{ulid}_{encoded_filename}_{uuid}_{op}{suffix}")
+        // Name-first layout: the base64(filename) is its own path segment, so a
+        // single name's scatter objects can be listed with
+        // `LIST prefix=<dir>/!/{base64(name)}/`. The ULID follows for ordering.
+        format!("{dir_staging_path}/{DEFAULT_DIR_INODE_SCATTER_FOLDER}/{encoded_filename}/{ulid}_{uuid}_{op}{suffix}")
+    }
+
+    /// base64(filename) with the `_`/`/`-free alphabet, so it is a safe single
+    /// path segment and `_` stays an unambiguous field separator after it.
+    pub fn encode_filename(filename: &str) -> String {
+        let alphabet = alphabet::Alphabet::new("*-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789").unwrap();
+        let crazy_config = engine::GeneralPurposeConfig::new()
+            .with_encode_padding(false);
+        engine::GeneralPurpose::new(&alphabet, crazy_config).encode(filename)
     }
 
     // input:
