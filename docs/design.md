@@ -52,7 +52,9 @@ s3://<bucket>/[<base>/]_TXN/<ulid>.intent   cross-directory rename intent
   attaches no meaning to it.
 
 Inside each prefix the standard Hyperfile structure applies (`inode`,
-`segment` files, and a scatter folder `!/`).
+`segment` files, and a scatter folder `!/`), plus optional sidecar objects:
+`_xattr/<name>` for extended attributes and `_lock` for the advisory-lock table
+(§10). Both are reclaimed with the prefix.
 
 ## 3. Directory index
 
@@ -186,17 +188,42 @@ Deletion is tombstone-based: it does not physically delete the child prefix.
   authoritative `nlink` (no scatter, OCC), then insert a directory entry
   pointing at the same UUID.
 
-## 10. Known limitations (PoC)
+## 10. Advisory locks (`lock` module)
+
+Optional S3-backed advisory locks (used by hyperfs's `--lock-mode global`).
+Two parts:
+
+- A storage-agnostic byte-range lock engine (`LockTable`) with POSIX semantics:
+  read/write compatibility, overlap, replace/split of the owner's own ranges,
+  group release by owner, and TTL expiry. Pure logic, unit-tested, no I/O.
+- A binding on `HyperDir` — `fs_getlk` / `fs_setlk` / `fs_unlock_owner` /
+  `fs_lock_renew` — that persists one table per file/dir in a single
+  `<DIR|FILE/uuid>/_lock` object. Reads are a plain GET; mutations are an OCC
+  loop (`GetObject` + decode + apply + `PutObject If-Match:<etag>`, or
+  `If-None-Match:*` to create), retried on a `412/409`. This is the same
+  conditional-write primitive as the compactor lease.
+
+`owner` is an opaque single-line token (hyperfs folds its per-mount client id
+with the kernel `lock_owner`). Each lock carries an absolute `expire_ms`; an
+expired entry is ignored and pruned on the next write, so a crashed holder's
+locks free on TTL — the holder is expected to renew within the TTL. Blocking
+acquisition is not implemented; the caller treats setlk as non-blocking. The
+`_lock` object lives under the child's prefix, so it is reclaimed automatically
+when the prefix is deleted (unlink / GC need no change).
+
+## 11. Known limitations (PoC)
 
 - TOCTOU windows in cross-directory rename / link (destination pre-check vs
   commit) and crash-window `nlink` over-count (a storage leak, never data loss).
 - Cached `nlink` in a listing can lag for hard-linked files (advisory).
 - `PreDelete` (two-phase delete) and `undelete` are unimplemented (the
   tombstone already preserves the full inode to enable undelete later).
+- Advisory locks have no blocking acquisition (non-blocking only), cost an S3
+  round-trip per op, and rely on TTL renewal to free a crashed holder's locks.
 - `inode_mut` relies on a `&self -> &mut Inode` transmute inherited from the
   `hyperfile` trait surface; to be addressed upstream.
 
-## 11. Engineering constraints
+## 12. Engineering constraints
 
 - The B-tree root is a fixed 56-byte inline area in the inode, but a directory
   entry is ~432 bytes, so the root must be an internal node from the first
@@ -208,7 +235,7 @@ Deletion is tombstone-based: it does not physically delete the child prefix.
   exceed the default ~2 MiB test-thread stack — a frame-size issue, not
   recursion. Use a large `RUST_MIN_STACK` (e.g. 64 MiB) or a release build.
 
-## 12. Tests
+## 13. Tests
 
 `tests/e2e_s3.rs` (`#[ignore]`, requires real S3 credentials + `S3_BUCKET` /
 `S3_REGION` + a large `RUST_MIN_STACK`) covers, end to end:
