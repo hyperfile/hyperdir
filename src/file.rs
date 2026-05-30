@@ -343,6 +343,44 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         }
     }
 
+    /// Scatter-aware single-name resolve (the cheap lookup path).
+    ///
+    /// Lists only this name's scatter objects (`!/{base64(name)}/`, 0..N).
+    /// If any exist, the latest wins (a Create/Update means present with that
+    /// inode; a Delete means absent), exactly as `read_dir` would merge them.
+    /// Only when the name has no pending scatter do we consult the compacted
+    /// B-tree via a cheap point lookup. This avoids `read_dir`'s full B-tree
+    /// walk and whole-`!/` fetch for the common (compacted) case, while never
+    /// trusting the B-tree for a name that still has pending scatter.
+    pub async fn resolve_entry(&self, name: &str) -> Result<Option<DirFileEntry>> {
+        let scatters = self.staging.list_scatter_inodes_for_name(name).await?;
+        if !scatters.is_empty() {
+            // All entries are for `name`; filter_last_view yields the single latest.
+            if let Some(latest) = DirScatterInode::filter_last_view(scatters).into_iter().next() {
+                match latest.op {
+                    DirScatterInodeOp::Create | DirScatterInodeOp::Update => {
+                        let fetched = self.staging.collect_scatter_inodes(vec![latest]).await?;
+                        if let Some((s, body)) = fetched.into_iter().next() {
+                            let inode_raw = InodeRaw::from_u8_slice(&body);
+                            let raw = DirFileEntryRaw::from(
+                                &inode_raw,
+                                s.uuid.as_bytes(),
+                                <String as AsRef<OsStr>>::as_ref(&s.filename).as_encoded_bytes(),
+                            );
+                            return Ok(Some(DirFileEntry::from_raw(&raw)));
+                        }
+                        return Ok(None);
+                    },
+                    DirScatterInodeOp::Delete => return Ok(None),
+                    // PreDelete/Unknown: fall through to the B-tree.
+                    _ => {},
+                }
+            }
+        }
+        let home = hash_filename(name);
+        Ok(self.probe_lookup(name.as_bytes(), home).await?.map(|(_, e)| DirFileEntry::from_raw(&e)))
+    }
+
     /// Look up the raw on-disk entry (inode + uuid + name) by name. Used by
     /// cross-directory rename to move an entry verbatim.
     pub async fn read_entry_raw(&self, name: &str) -> Result<DirFileEntryRaw> {
