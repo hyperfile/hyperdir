@@ -369,7 +369,8 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
                             );
                             return Ok(Some(DirFileEntry::from_raw(&raw)));
                         }
-                        return Ok(None);
+                        // The body was compacted away under us; the entry is now
+                        // in the B-tree, so fall through to the point lookup.
                     },
                     DirScatterInodeOp::Delete => return Ok(None),
                     // PreDelete/Unknown: fall through to the B-tree.

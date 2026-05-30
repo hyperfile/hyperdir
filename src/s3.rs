@@ -72,6 +72,13 @@ impl DirStaging for S3Staging {
                     v_res.push((scatter, agg_bytes.into_bytes()));
             	},
             	Err(sdk_err) => {
+            	    // A concurrent compactor may have folded this scatter into the
+            	    // B-tree and deleted it between our LIST and this GET. That's
+            	    // not an error: skip it (the entry is now in the B-tree).
+            	    if sdk_err.as_service_error().is_some_and(|e| e.is_no_such_key()) {
+            	        warn!("scatter {} vanished (compacted concurrently), skipping", key);
+            	        continue;
+            	    }
             	    let err_str = format!("GetObject s3://{}/{} error: {}", self.bucket, key, sdk_err);
             	    error!("{}", err_str);
             	    return Err(Error::other(err_str));

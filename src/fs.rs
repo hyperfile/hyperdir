@@ -323,12 +323,23 @@ impl<'a> HyperDir<'a>
                 format!("hard link to a directory is not allowed: {}", child_uri)));
         }
 
-        // Bump the authoritative nlink, then add the new entry.
+        // Bump the authoritative nlink (its own OCC retry), then add the new
+        // entry. The insert flush can lose an OCC race with a concurrent
+        // compactor; retry just the insert (re-opening to refresh the inode)
+        // so nlink is bumped exactly once.
         let new_nlink = adjust_nlink(client, &child_uri, 1).await?;
         raw_inode.i_nlink = new_nlink;
         let entry = crate::ondisk::DirFileEntryRaw::from(&raw_inode, target_file_uuid.as_bytes(), new_name.as_bytes());
-        parent.inner.insert_entry(new_name, entry).await?;
-        Ok(())
+        for _ in 0..NLINK_RETRIES {
+            match parent.inner.insert_entry(new_name, entry).await {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    parent = Self::fs_open_dir(client, layout, bucket, parent_dir_uuid, FileFlags::rdwr()).await?;
+                },
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::new(ErrorKind::ResourceBusy, "fs_link: too many OCC conflicts"))
     }
 
     /// Remove an empty child directory.
