@@ -653,9 +653,11 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     /// and committed by a single inode flush, so the rename is atomic against
     /// concurrent writers via hyperfile's inode OCC.
     ///
-    /// The destination must not already exist; replace-over-existing returns
-    /// `AlreadyExists` and is left to the caller (it would otherwise orphan
-    /// the displaced child's storage). `old_name == new_name` is a no-op.
+    /// Source must exist (`NotFound`). If the destination already exists its
+    /// entry is overwritten in place (the btree slot is replaced, so no
+    /// tombstone is written and reads never see the name vanish); the caller
+    /// is responsible for reclaiming the displaced child's storage. `old_name
+    /// == new_name` is a no-op.
     pub async fn rename_within(&mut self, old_name: &str, new_name: &str) -> Result<()> {
         if old_name == new_name {
             return Ok(());
@@ -666,13 +668,9 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             None => return Err(Error::new(ErrorKind::NotFound,
                 format!("rename source not found: {}", old_name))),
         };
-        let new_home = hash_filename(new_name);
-        if self.probe_lookup(new_name.as_bytes(), new_home).await?.is_some() {
-            return Err(Error::new(ErrorKind::AlreadyExists,
-                format!("rename target exists: {}", new_name)));
-        }
 
-        // Same inode + uuid, new name.
+        // Same inode + uuid, new name. probe_upsert overwrites an existing
+        // destination slot in place (replace-over-existing).
         let new_entry = DirFileEntryRaw::from(&entry.inode, &entry.uuid, new_name.as_bytes());
         self.probe_delete(old_name.as_bytes()).await?;
         self.probe_upsert(new_name.as_bytes(), new_entry).await?;
