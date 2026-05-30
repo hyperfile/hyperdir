@@ -876,28 +876,77 @@ impl<'a> HyperDir<'a>
     /// `/` delimiter. Used by a maintenance pass to drive per-directory
     /// `fs_compact` / `fs_gc` across the whole tree.
     pub async fn fs_list_dir_uuids(client: &Client, layout: &HyperDirLayout, bucket: &str) -> Result<Vec<Uuid>> {
-        let prefix = layout.dir_prefix();
-        debug!("fs_list_dir_uuids - prefix: {}", prefix);
-        let mut out = Vec::new();
-        let mut stream = client.list_objects_v2()
-            .bucket(bucket)
-            .prefix(&prefix)
-            .delimiter("/")
-            .into_paginator()
-            .send();
-        while let Some(page) = stream.next().await {
-            let page = page.map_err(|e| Error::other(format!("ListObjectsV2 {}: {}", prefix, e)))?;
-            for cp in page.common_prefixes() {
-                let Some(p) = cp.prefix() else { continue };
-                // p = "<base>DIR/<uuid>/"
-                let rest = p.strip_prefix(&prefix).unwrap_or(p).trim_end_matches('/');
-                if let Ok(u) = Uuid::parse_str(rest) {
-                    out.push(u);
+        list_namespace_uuids(client, bucket, &layout.dir_prefix()).await
+    }
+
+    /// Enumerate every file's UUID by listing the `FILE/` namespace.
+    pub async fn fs_list_file_uuids(client: &Client, layout: &HyperDirLayout, bucket: &str) -> Result<Vec<Uuid>> {
+        list_namespace_uuids(client, bucket, &layout.file_prefix()).await
+    }
+
+    /// Reclaim orphaned files: those no directory entry references anymore.
+    ///
+    /// The name-keyed tombstone GC ([`fs_gc`]) can't see a file that became
+    /// nameless without a tombstone (e.g. the rare hard-linked child displaced
+    /// by a replace-over-existing rename, left with a stale-high nlink). This
+    /// is the backstop: mark every UUID referenced by any directory's
+    /// `read_dir` (scatter-aware, so freshly created entries count), then purge
+    /// any `FILE/<uuid>` not in that set whose inode is older than `grace`. The
+    /// grace window avoids collecting a file whose creation is still in flight.
+    pub async fn fs_gc_orphans(client: &Client, layout: &HyperDirLayout, bucket: &str, grace: Duration) -> Result<usize> {
+        use std::collections::HashSet;
+        let mut referenced: HashSet<Uuid> = HashSet::new();
+        for d in Self::fs_list_dir_uuids(client, layout, bucket).await? {
+            if let Ok(dir) = Self::fs_open_dir(client, layout, bucket, &d, FileFlags::rdonly()).await {
+                if let Ok(entries) = dir.fs_read_dir().await {
+                    for e in entries { referenced.insert(e.uuid); }
                 }
             }
         }
-        Ok(out)
+
+        let now_ms = unix_now_ms();
+        let grace_ms = i64::try_from(grace.as_millis()).unwrap_or(i64::MAX);
+        let mut reclaimed = 0;
+        for fu in Self::fs_list_file_uuids(client, layout, bucket).await? {
+            if referenced.contains(&fu) { continue; }
+            let uri = layout.file_uri(bucket, &fu);
+            // Skip files whose inode is younger than the grace window (an
+            // in-flight create not yet visible to read_dir).
+            match Self::fs_getattr_fast(client, &uri).await {
+                Ok(st) if now_ms - st.st_ctime.saturating_mul(1000) >= grace_ms => {
+                    if reclaim_child_prefix(client, &uri, HyperFileRuntimeConfig::default()).await.is_ok() {
+                        reclaimed += 1;
+                    }
+                },
+                _ => {}, // young, or already gone
+            }
+        }
+        Ok(reclaimed)
     }
+}
+
+/// List the UUIDs of the prefixes directly under `prefix` (e.g. `DIR/` or
+/// `FILE/`), using a `/` delimiter to get one common prefix per UUID.
+async fn list_namespace_uuids(client: &Client, bucket: &str, prefix: &str) -> Result<Vec<Uuid>> {
+    debug!("list_namespace_uuids - prefix: {}", prefix);
+    let mut out = Vec::new();
+    let mut stream = client.list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .delimiter("/")
+        .into_paginator()
+        .send();
+    while let Some(page) = stream.next().await {
+        let page = page.map_err(|e| Error::other(format!("ListObjectsV2 {}: {}", prefix, e)))?;
+        for cp in page.common_prefixes() {
+            let Some(p) = cp.prefix() else { continue };
+            let rest = p.strip_prefix(prefix).unwrap_or(p).trim_end_matches('/');
+            if let Ok(u) = Uuid::parse_str(rest) {
+                out.push(u);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Statistics returned from [`HyperDir::fs_gc`].
