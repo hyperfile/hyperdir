@@ -104,6 +104,12 @@ impl HyperDirLayout {
     pub fn dir_prefix(&self) -> String {
         format!("{}{DIR_NAMESPACE}/", self.base)
     }
+
+    /// LIST prefix covering every file's prefix (use with delimiter `/`
+    /// to enumerate `FILE/<uuid>/` common prefixes).
+    pub fn file_prefix(&self) -> String {
+        format!("{}{FILE_NAMESPACE}/", self.base)
+    }
 }
 
 #[cfg(test)]
