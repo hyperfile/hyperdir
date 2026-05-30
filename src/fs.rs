@@ -366,6 +366,37 @@ impl<'a> HyperDir<'a>
         Self::fs_unlink(client, layout, bucket, parent_dir_uuid, name, child_dir_uuid, true, retention).await
     }
 
+    /// Reclaim a child that was displaced by a replace-over-existing rename.
+    ///
+    /// Unlike [`fs_unlink`], the displaced child has no name left in any
+    /// directory (its entry was overwritten in place), so it cannot be
+    /// reclaimed by the name-keyed tombstone/GC path. We reclaim it directly:
+    /// for a file, decrement the authoritative link count and purge the prefix
+    /// only when it reaches zero (other hard links may remain); for a
+    /// directory (single link), purge unconditionally. A crash before this
+    /// runs leaks storage but never loses data.
+    pub async fn fs_reclaim(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+        child_uuid: &Uuid,
+        child_is_dir: bool,
+    ) -> Result<()>
+    {
+        if child_is_dir {
+            let uri = layout.dir_uri(bucket, child_uuid);
+            debug!("fs_reclaim - dir: {}", uri);
+            return reclaim_child_prefix(client, &uri, HyperFileRuntimeConfig::default()).await;
+        }
+        let uri = layout.file_uri(bucket, child_uuid);
+        debug!("fs_reclaim - file: {}", uri);
+        let nlink = adjust_nlink(client, &uri, -1).await?;
+        if nlink == 0 {
+            reclaim_child_prefix(client, &uri, HyperFileRuntimeConfig::default()).await?;
+        }
+        Ok(())
+    }
+
     /// Reclaim physical storage for tombstoned children whose retention has
     /// expired.
     ///
@@ -804,13 +835,10 @@ async fn emit_rename_intent(
     let entry_raw = src.inner.read_entry_raw(src_name).await?;
     drop(src);
 
-    let dst = HyperDir::fs_open_dir(client, layout, bucket, dst_parent_uuid, FileFlags::rdonly()).await?;
-    if dst.inner.read_entry(dst_name).await.is_ok() {
-        return Err(Error::new(ErrorKind::AlreadyExists,
-            format!("rename target exists: {}/{}", dst_parent_uuid, dst_name)));
-    }
-    drop(dst);
-
+    // An existing destination is overwritten: apply_rename_intent's
+    // destination-add is an upsert, so the displaced entry's btree slot is
+    // replaced in place (no tombstone). The caller reclaims the displaced
+    // child's storage.
     let intent = RenameIntent {
         src_parent: *src_parent_uuid,
         src_name: src_name.to_string(),
