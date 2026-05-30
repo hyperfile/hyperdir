@@ -4,6 +4,7 @@ use log::{debug, warn};
 use uuid::Uuid;
 use ulid::Ulid;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::SdkBody;
 use hyperfile::file::flags::{FileFlags, HyperFileFlags};
@@ -436,6 +437,69 @@ impl<'a> HyperDir<'a>
     /// Delete an intent object (best-effort cleanup of a committed reclaim).
     pub async fn fs_delete_intent(client: &Client, bucket: &str, key: &str) -> Result<()> {
         delete_object(client, bucket, key).await
+    }
+
+    /// Set an extended attribute (last-write-wins plain PUT). Stored as a
+    /// sidecar object `<child prefix>/_xattr/<base64url(name)>`; it lives under
+    /// the inode's prefix, so hyperfile's prefix-wide unlink reclaims it too.
+    /// Namespace policy (e.g. user.* only) is enforced by the caller.
+    pub async fn fs_setxattr(client: &Client, layout: &HyperDirLayout, bucket: &str, uuid: &Uuid, is_dir: bool, name: &str, value: &[u8]) -> Result<()> {
+        let key = xattr_key(layout, uuid, is_dir, name);
+        client.put_object()
+            .bucket(bucket)
+            .key(&key)
+            .body(SdkBody::from(value.to_vec()).into())
+            .send()
+            .await
+            .map_err(|e| Error::other(format!("PutObject xattr s3://{}/{}: {}", bucket, key, e)))?;
+        Ok(())
+    }
+
+    /// Get an extended attribute's value, or `None` if it isn't set.
+    pub async fn fs_getxattr(client: &Client, layout: &HyperDirLayout, bucket: &str, uuid: &Uuid, is_dir: bool, name: &str) -> Result<Option<Vec<u8>>> {
+        let key = xattr_key(layout, uuid, is_dir, name);
+        match client.get_object().bucket(bucket).key(&key).send().await {
+            Ok(res) => {
+                let bytes = res.body.collect().await
+                    .map_err(|e| Error::other(format!("collect xattr s3://{}/{}: {}", bucket, key, e)))?
+                    .into_bytes();
+                Ok(Some(bytes.to_vec()))
+            },
+            Err(e) if e.as_service_error().is_some_and(|s| s.is_no_such_key()) => Ok(None),
+            Err(e) => Err(Error::other(format!("GetObject xattr s3://{}/{}: {}", bucket, key, e))),
+        }
+    }
+
+    /// List the names of all set extended attributes.
+    pub async fn fs_listxattr(client: &Client, layout: &HyperDirLayout, bucket: &str, uuid: &Uuid, is_dir: bool) -> Result<Vec<String>> {
+        let prefix = xattr_prefix(layout, uuid, is_dir);
+        let mut names = Vec::new();
+        let mut stream = client.list_objects_v2()
+            .bucket(bucket)
+            .prefix(&prefix)
+            .delimiter("/")
+            .into_paginator()
+            .send();
+        while let Some(page) = stream.next().await {
+            let page = page.map_err(|e| Error::other(format!("ListObjectsV2 {}: {}", prefix, e)))?;
+            for obj in page.contents() {
+                let Some(seg) = obj.key().and_then(|k| k.strip_prefix(&prefix)) else { continue };
+                if seg.is_empty() { continue; }
+                if let Ok(bytes) = B64URL.decode(seg) {
+                    if let Ok(s) = String::from_utf8(bytes) { names.push(s); }
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// Remove an extended attribute. Returns `false` if it wasn't set.
+    pub async fn fs_removexattr(client: &Client, layout: &HyperDirLayout, bucket: &str, uuid: &Uuid, is_dir: bool, name: &str) -> Result<bool> {
+        if Self::fs_getxattr(client, layout, bucket, uuid, is_dir, name).await?.is_none() {
+            return Ok(false);
+        }
+        delete_object(client, bucket, &xattr_key(layout, uuid, is_dir, name)).await?;
+        Ok(true)
     }
 
     /// Reclaim physical storage for tombstoned children whose retention has
@@ -1060,6 +1124,17 @@ async fn delete_object(client: &Client, bucket: &str, key: &str) -> Result<()> {
 /// True if a Unix mode word denotes a directory (`S_IFDIR`).
 fn is_dir_mode(mode: u32) -> bool {
     (mode & libc::S_IFMT) == libc::S_IFDIR
+}
+
+/// S3 key of one extended-attribute sidecar object under the child's prefix.
+fn xattr_key(layout: &HyperDirLayout, uuid: &Uuid, is_dir: bool, name: &str) -> String {
+    format!("{}{}", xattr_prefix(layout, uuid, is_dir), B64URL.encode(name))
+}
+
+/// LIST prefix covering a child's extended-attribute sidecar objects.
+fn xattr_prefix(layout: &HyperDirLayout, uuid: &Uuid, is_dir: bool) -> String {
+    let base = if is_dir { layout.dir_key(uuid) } else { layout.file_key(uuid) };
+    format!("{}/_xattr/", base)
 }
 
 /// Maximum optimistic-concurrency retries for an nlink read-modify-write.
