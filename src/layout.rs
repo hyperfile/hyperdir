@@ -92,6 +92,12 @@ impl HyperDirLayout {
     pub fn txn_prefix(&self) -> String {
         format!("{}{TXN_NAMESPACE}/", self.base)
     }
+
+    /// LIST prefix covering every directory's prefix (use with delimiter `/`
+    /// to enumerate `DIR/<uuid>/` common prefixes).
+    pub fn dir_prefix(&self) -> String {
+        format!("{}{DIR_NAMESPACE}/", self.base)
+    }
 }
 
 #[cfg(test)]
