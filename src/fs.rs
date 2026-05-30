@@ -733,6 +733,33 @@ impl<'a> HyperDir<'a>
     pub async fn fs_open_dir(client: &Client, layout: &HyperDirLayout, bucket: &str, uuid: &Uuid, flags: FileFlags) -> Result<Self> {
         Self::fs_open(client, &layout.dir_uri(bucket, uuid), flags).await
     }
+
+    /// Enumerate every directory's UUID by listing the `DIR/` namespace with a
+    /// `/` delimiter. Used by a maintenance pass to drive per-directory
+    /// `fs_compact` / `fs_gc` across the whole tree.
+    pub async fn fs_list_dir_uuids(client: &Client, layout: &HyperDirLayout, bucket: &str) -> Result<Vec<Uuid>> {
+        let prefix = layout.dir_prefix();
+        debug!("fs_list_dir_uuids - prefix: {}", prefix);
+        let mut out = Vec::new();
+        let mut stream = client.list_objects_v2()
+            .bucket(bucket)
+            .prefix(&prefix)
+            .delimiter("/")
+            .into_paginator()
+            .send();
+        while let Some(page) = stream.next().await {
+            let page = page.map_err(|e| Error::other(format!("ListObjectsV2 {}: {}", prefix, e)))?;
+            for cp in page.common_prefixes() {
+                let Some(p) = cp.prefix() else { continue };
+                // p = "<base>DIR/<uuid>/"
+                let rest = p.strip_prefix(&prefix).unwrap_or(p).trim_end_matches('/');
+                if let Ok(u) = Uuid::parse_str(rest) {
+                    out.push(u);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Statistics returned from [`HyperDir::fs_gc`].
