@@ -88,6 +88,12 @@ impl HyperDirLayout {
         format!("{}{TXN_NAMESPACE}/{}.intent", self.base, txn_id)
     }
 
+    /// Key of a displaced-child reclaim intent object (rename replace-over-
+    /// existing), identified by `txn_id`.
+    pub fn reclaim_key(&self, txn_id: &str) -> String {
+        format!("{}{TXN_NAMESPACE}/{}.reclaim", self.base, txn_id)
+    }
+
     /// LIST prefix covering all rename intent objects.
     pub fn txn_prefix(&self) -> String {
         format!("{}{TXN_NAMESPACE}/", self.base)
