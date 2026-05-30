@@ -109,10 +109,23 @@ impl DirStaging for S3Staging {
                 .send()
                 .await
             {
-                Ok(_) => {},
+                Ok(output) => {
+                    // quiet(true) makes a successful DeleteObjects return only
+                    // the per-object failures. A 200 response can still report
+                    // individual keys that were not deleted; treat any as a
+                    // failure so compact/gc retries rather than silently
+                    // leaving scatter / child objects behind.
+                    let failed = output.errors();
+                    if !failed.is_empty() {
+                        err = true;
+                        for e in failed {
+                            error!("delete objects: key={:?} code={:?} message={:?}",
+                                   e.key(), e.code(), e.message());
+                        }
+                    }
+                },
                 Err(sdk_err) => {
                     err = true;
-                    // TODO: check delete objects result with signle delete error
                     error!("delete objects error: {}", sdk_err);
                 }
             }
