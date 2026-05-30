@@ -337,7 +337,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     /// or an empty slot (NotFound) is found.
     pub async fn read_entry(&self, name: &str) -> Result<DirFileEntry> {
         let home = hash_filename(name);
-        match self.probe_lookup(name.as_bytes(), home).await? {
+        match self.probe_lookup_latest(name.as_bytes(), home).await? {
             Some((_, entry)) => Ok(DirFileEntry::from_raw(&entry)),
             None => Err(Error::new(ErrorKind::NotFound, format!("entry not found: {}", name))),
         }
@@ -379,7 +379,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             }
         }
         let home = hash_filename(name);
-        Ok(self.probe_lookup(name.as_bytes(), home).await?.map(|(_, e)| DirFileEntry::from_raw(&e)))
+        Ok(self.probe_lookup_latest(name.as_bytes(), home).await?.map(|(_, e)| DirFileEntry::from_raw(&e)))
     }
 
     /// Look up the raw on-disk entry (inode + uuid + name) by name. Used by
@@ -394,6 +394,10 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
 
     /// Insert/update an entry under `name` and flush. Idempotent.
     pub async fn insert_entry(&mut self, name: &str, entry: DirFileEntryRaw) -> Result<()> {
+        // Mutate from the LATEST committed bmap, not this handle's open-time
+        // snapshot: a concurrent compactor may have folded other entries into
+        // a newer inode, and flushing our stale bmap would drop them.
+        self.reload_to_latest().await?;
         self.probe_upsert(name.as_bytes(), entry).await?;
         self.flush().await?;
         Ok(())
@@ -401,6 +405,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
 
     /// Remove the entry named `name` and flush. Returns false if absent.
     pub async fn remove_entry(&mut self, name: &str) -> Result<bool> {
+        self.reload_to_latest().await?;
         let removed = self.probe_delete(name.as_bytes()).await?;
         self.flush().await?;
         Ok(removed)
@@ -417,15 +422,24 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     /// differ if other writers commit between them. Outstanding scatter
     /// objects are *not* deleted here; that is the job of [`compact`].
     pub async fn read_dir(&self) -> Result<Vec<DirFileEntry>> {
+        // List scatter FIRST, then read the LATEST persisted bmap. Compact
+        // always flushes the bmap before deleting the scatter objects it
+        // folded, so reading the bmap *after* the scatter LIST guarantees any
+        // scatter that has since vanished (deleted by a concurrent compactor)
+        // is already reflected in this freshly-read bmap. We deliberately do
+        // NOT use this handle's open-time bmap snapshot: a compact since open
+        // could have advanced the persisted bmap and removed the very scatters
+        // that carried those changes, which would make us miss/stale entries.
         let changes = self.collect_scatter_changes().await?;
+        let latest_bmap = self.load_latest_bmap().await?;
 
-        // start from the persisted bmap snapshot, keyed by filename
+        // start from the latest persisted bmap, keyed by filename
         let mut view: HashMap<String, DirFileEntryRaw> = HashMap::new();
-        for entry in self.walk_bmap_snapshot().await? {
+        for entry in Self::walk_bmap(&latest_bmap).await? {
             view.insert(String::from_utf8_lossy(entry.name_bytes()).into_owned(), entry);
         }
 
-        // overlay scatter changes (also keyed by filename)
+        // overlay scatter changes (also keyed by filename); scatter wins
         for (name, entry) in changes.upserts {
             view.insert(name, entry);
         }
@@ -469,6 +483,13 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     /// Body of [`compact`], assuming the caller has already acquired the
     /// compactor lease for this directory.
     async fn compact_inner(&mut self) -> Result<CompactStats> {
+        // Fold into (and leave the handle on) the LATEST committed bmap, not
+        // this handle's open-time snapshot. This matters both for correctness
+        // of the fold under a concurrent compactor and because callers reuse
+        // this handle right after (e.g. rename compacts then renames on the
+        // same handle): a no-op compact must still leave the bmap current so
+        // the following lookup doesn't miss an entry another compactor folded.
+        self.reload_to_latest().await?;
         let changes = self.collect_scatter_changes().await?;
         if changes.all_keys.is_empty() {
             return Ok(CompactStats { no_op: true, ..Default::default() });
@@ -571,9 +592,41 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
 
     /// Walk the persisted bmap read-only, returning all valid entries.
     /// Skips dummy values inserted by hyperfile as bmap placeholders.
-    async fn walk_bmap_snapshot(&self) -> Result<Vec<DirFileEntryRaw>> {
+    /// Build a fresh bmap from the LATEST persisted inode (re-read from
+    /// staging), independent of this handle's open-time snapshot. Used by
+    /// `read_dir` so it never walks a bmap a concurrent compactor has
+    /// superseded.
+    async fn load_latest_bmap(&self) -> Result<BMap<'a, BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>> {
+        let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        let _ = self.staging.load_inode(raw_inode.as_mut_u8_slice()).await?;
+        let meta_config = HyperFileMetaConfig::from_u32(raw_inode.i_meta_config);
+        let b = raw_inode.i_bmap;
+        BMap::<BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>::read(
+            &b, meta_config.meta_block_size, self.bmap_get_block_loader(), NullNodeCache)
+    }
+
+    /// Replace this handle's in-memory inode + bmap with the LATEST persisted
+    /// state, discarding the open-time snapshot. A write op that looks up an
+    /// entry (rename, link) must do this first: a concurrent compactor may
+    /// have folded the entry into a newer inode and deleted its scatter, so
+    /// the open-time bmap would miss it. Only safe when the handle has no
+    /// un-flushed changes (compaction calls it before folding).
+    async fn reload_to_latest(&mut self) -> Result<()> {
+        let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        let od_state = self.staging.load_inode(raw_inode.as_mut_u8_slice()).await?;
+        let meta_config = HyperFileMetaConfig::from_u32(raw_inode.i_meta_config);
+        let bmap = BMap::<BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>::read(
+            &raw_inode.i_bmap, meta_config.meta_block_size, self.bmap_get_block_loader(), NullNodeCache)?;
+        self.bmap = bmap;
+        self.config.meta = meta_config;
+        self.inode = Inode::from_raw(&raw_inode, od_state);
+        Ok(())
+    }
+
+    /// Enumerate the live (non-dummy) entries of `bmap`.
+    async fn walk_bmap(bmap: &BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>) -> Result<Vec<DirFileEntryRaw>> {
         let mut out: Vec<DirFileEntryRaw> = Vec::new();
-        let opt_last_key = match self.bmap.last_key().await {
+        let opt_last_key = match bmap.last_key().await {
             Ok(k) => Some(k),
             Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(e) => return Err(e),
@@ -581,7 +634,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         if let Some(last_key) = opt_last_key {
             let mut n: BlockIndex = 0;
             loop {
-                let key = match self.bmap.seek_key(&n).await {
+                let key = match bmap.seek_key(&n).await {
                     Ok(k) => k,
                     Err(e) if e.kind() == ErrorKind::NotFound => break,
                     Err(e) => return Err(e),
@@ -589,7 +642,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
                 if key > last_key {
                     break;
                 }
-                let val = self.bmap.lookup(&key).await?;
+                let val = bmap.lookup(&key).await?;
                 if !val.is_dummy() {
                     out.push(val);
                 }
@@ -610,9 +663,25 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     /// Probing does not wrap; with CRC64 spread uniformly over u64 and tiny
     /// clusters in practice, a chain reaching `u64::MAX` does not occur.
     async fn probe_lookup(&self, name: &[u8], home: BlockIndex) -> Result<Option<(BlockIndex, DirFileEntryRaw)>> {
+        Self::probe_lookup_in(&self.bmap, name, home).await
+    }
+
+    /// Like [`probe_lookup`] but against the LATEST persisted bmap, re-read
+    /// from staging rather than this handle's open-time snapshot. Read-path
+    /// point lookups (`read_entry`, `resolve_entry`'s fallback) must use this:
+    /// a concurrent compactor can fold a name into a new inode and delete its
+    /// scatter, which would make an open-time-snapshot lookup miss it.
+    async fn probe_lookup_latest(&self, name: &[u8], home: BlockIndex) -> Result<Option<(BlockIndex, DirFileEntryRaw)>> {
+        let bmap = self.load_latest_bmap().await?;
+        Self::probe_lookup_in(&bmap, name, home).await
+    }
+
+    async fn probe_lookup_in(bmap: &BMap<'_, BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>, name: &[u8], home: BlockIndex)
+        -> Result<Option<(BlockIndex, DirFileEntryRaw)>>
+    {
         let mut k = home;
         loop {
-            match self.bmap.lookup(&k).await {
+            match bmap.lookup(&k).await {
                 Ok(entry) => {
                     if !entry.is_dummy() && entry.name_eq(name) {
                         return Ok(Some((k, entry)));

@@ -555,6 +555,11 @@ impl<'a> HyperDir<'a>
         let scatters = parent_staging.list_scatter_inodes().await?;
         let now_ms = unix_now_ms();
 
+        // Read handle used to check whether a tombstone's delete has been
+        // folded into the persisted bmap yet (see the per-tombstone guard
+        // below). Opened once and reused.
+        let dir = Self::fs_open(client, &parent_uri, FileFlags::rdonly()).await?;
+
         let mut stats = GcStats::default();
 
         for scatter in scatters {
@@ -587,6 +592,28 @@ impl<'a> HyperDir<'a>
             if header.retention_until_unix_ms > now_ms {
                 stats.tombstones_skipped_retention += 1;
                 continue;
+            }
+
+            // Fold guard: only finalize a tombstone whose delete has been
+            // folded out of the persisted bmap. If the name still resolves in
+            // the bmap to this same uuid, a compact hasn't folded the delete
+            // yet; deleting the tombstone now would leave the bmap entry as a
+            // ghost (read_dir would show it with no tombstone to mask it).
+            // Leave it for a future GC pass after a compact folds the delete.
+            // (A name resolving to a *different* uuid means this delete was
+            // already superseded/folded, so it is safe to finalize.)
+            match dir.fs_read_entry(&scatter.filename).await {
+                Ok(entry) if entry.uuid == scatter.uuid => {
+                    stats.tombstones_skipped_unfolded += 1;
+                    continue;
+                },
+                Ok(_) => {}, // name now maps elsewhere: this delete is folded/superseded
+                Err(e) if e.kind() == ErrorKind::NotFound => {}, // folded out: safe
+                Err(e) => {
+                    warn!("fs_gc: bmap fold-check failed for {}: {}", scatter.filename, e);
+                    stats.errors += 1;
+                    continue;
+                },
             }
 
             // Resolve the child's prefix from its UUID and kind. The kind is
@@ -968,6 +995,11 @@ pub struct GcStats {
     /// Tombstones whose retention had not yet expired and were left in
     /// place for a future GC pass.
     pub tombstones_skipped_retention: usize,
+    /// Tombstones whose delete has not yet been folded into the persisted
+    /// bmap (the name is still live there). Finalizing them now would orphan
+    /// the bmap entry, so they are left for a future GC pass (after a compact
+    /// folds the delete).
+    pub tombstones_skipped_unfolded: usize,
     /// Tombstones whose child prefix was successfully unlinked and whose
     /// scatter object was successfully removed.
     pub tombstones_reclaimed: usize,
