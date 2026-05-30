@@ -353,13 +353,23 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
     /// walk and whole-`!/` fetch for the common (compacted) case, while never
     /// trusting the B-tree for a name that still has pending scatter.
     pub async fn resolve_entry(&self, name: &str) -> Result<Option<DirFileEntry>> {
-        let scatters = self.staging.list_scatter_inodes_for_name(name).await?;
+        Self::resolve_fast(self.staging.clone(), self.bmap_get_block_loader(), name).await
+    }
+
+    /// Handle-less single-name resolve: the real logic behind `resolve_entry`,
+    /// usable without first opening a `HyperDirFile`. Takes a `staging` (for
+    /// the scatter LIST / body GET) and a block `loader` (for the fallback
+    /// bmap), so the caller pays at most one inode GET (only on the fallback,
+    /// and zero when the name still has pending scatter) instead of an
+    /// open-the-handle inode GET plus the fallback's.
+    pub async fn resolve_fast(staging: T, loader: L, name: &str) -> Result<Option<DirFileEntry>> {
+        let scatters = staging.list_scatter_inodes_for_name(name).await?;
         if !scatters.is_empty() {
             // All entries are for `name`; filter_last_view yields the single latest.
             if let Some(latest) = DirScatterInode::filter_last_view(scatters).into_iter().next() {
                 match latest.op {
                     DirScatterInodeOp::Create | DirScatterInodeOp::Update => {
-                        let fetched = self.staging.collect_scatter_inodes(vec![latest]).await?;
+                        let fetched = staging.collect_scatter_inodes(vec![latest]).await?;
                         if let Some((s, body)) = fetched.into_iter().next() {
                             let inode_raw = InodeRaw::from_u8_slice(&body);
                             let raw = DirFileEntryRaw::from(
@@ -378,8 +388,14 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
                 }
             }
         }
+        // Fallback: read the latest inode, build its bmap, and point-look-up.
+        let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        staging.load_inode(raw_inode.as_mut_u8_slice()).await?;
+        let meta_config = HyperFileMetaConfig::from_u32(raw_inode.i_meta_config);
+        let bmap = BMap::<BlockIndex, DirFileEntryRaw, BlockPtr, L, NullNodeCache>::read(
+            &raw_inode.i_bmap, meta_config.meta_block_size, loader, NullNodeCache)?;
         let home = hash_filename(name);
-        Ok(self.probe_lookup_latest(name.as_bytes(), home).await?.map(|(_, e)| DirFileEntry::from_raw(&e)))
+        Ok(Self::probe_lookup_in(&bmap, name.as_bytes(), home).await?.map(|(_, e)| DirFileEntry::from_raw(&e)))
     }
 
     /// Look up the raw on-disk entry (inode + uuid + name) by name. Used by
