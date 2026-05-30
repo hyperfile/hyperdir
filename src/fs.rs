@@ -370,11 +370,14 @@ impl<'a> HyperDir<'a>
     ///
     /// Unlike [`fs_unlink`], the displaced child has no name left in any
     /// directory (its entry was overwritten in place), so it cannot be
-    /// reclaimed by the name-keyed tombstone/GC path. We reclaim it directly:
-    /// for a file, decrement the authoritative link count and purge the prefix
-    /// only when it reaches zero (other hard links may remain); for a
-    /// directory (single link), purge unconditionally. A crash before this
-    /// runs leaks storage but never loses data.
+    /// reclaimed by the name-keyed tombstone/GC path. We reclaim it directly.
+    ///
+    /// This is **idempotent** so it is safe to run from both the foreground
+    /// rename and crash recovery: a file is purged only when its stored
+    /// `nlink <= 1` (the displaced name was the last/only one), never by a
+    /// blind decrement. A still-hard-linked file (`nlink > 1`) is left in
+    /// place — its `nlink` stays stale-high (a future leak on its final
+    /// unlink, never data loss). Directories (single link) are purged.
     pub async fn fs_reclaim(
         client: &Client,
         layout: &HyperDirLayout,
@@ -390,11 +393,49 @@ impl<'a> HyperDir<'a>
         }
         let uri = layout.file_uri(bucket, child_uuid);
         debug!("fs_reclaim - file: {}", uri);
-        let nlink = adjust_nlink(client, &uri, -1).await?;
-        if nlink == 0 {
-            reclaim_child_prefix(client, &uri, HyperFileRuntimeConfig::default()).await?;
+        match current_nlink(client, &uri).await? {
+            None => Ok(()),                                                   // already reclaimed
+            Some(n) if n <= 1 => reclaim_child_prefix(client, &uri, HyperFileRuntimeConfig::default()).await,
+            Some(_) => Ok(()),                                                // still hard-linked elsewhere
         }
-        Ok(())
+    }
+
+    /// Durably record (commit point, `If-None-Match: *`) that `displaced` was
+    /// replaced under `dst_parent/dst_name` by a rename, so a crash before the
+    /// foreground reclaim doesn't orphan its storage. Returns the intent key,
+    /// which the caller deletes once it has reclaimed. Left-behind intents are
+    /// completed by [`fs_recover_renames`].
+    pub async fn fs_emit_reclaim_intent(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+        dst_parent: &Uuid,
+        dst_name: &str,
+        displaced: &Uuid,
+        displaced_is_dir: bool,
+    ) -> Result<String>
+    {
+        let intent = ReclaimIntent {
+            dst_parent: *dst_parent,
+            dst_name: dst_name.to_string(),
+            displaced: *displaced,
+            displaced_is_dir,
+        };
+        let key = layout.reclaim_key(&Ulid::new().to_string());
+        client.put_object()
+            .bucket(bucket)
+            .key(&key)
+            .body(SdkBody::from(intent.serialize().as_bytes()).into())
+            .if_none_match('*')
+            .send()
+            .await
+            .map_err(|e| Error::other(format!("PutObject reclaim s3://{}/{}: {}", bucket, key, e)))?;
+        Ok(key)
+    }
+
+    /// Delete an intent object (best-effort cleanup of a committed reclaim).
+    pub async fn fs_delete_intent(client: &Client, bucket: &str, key: &str) -> Result<()> {
+        delete_object(client, bucket, key).await
     }
 
     /// Reclaim physical storage for tombstoned children whose retention has
@@ -714,15 +755,40 @@ impl<'a> HyperDir<'a>
             if let Some(objects) = page.contents {
                 for obj in objects.iter() {
                     let Some(key) = obj.key() else { continue };
-                    if !key.ends_with(".intent") { continue; }
-                    let body = get_object_raw(client, bucket, key).await?;
-                    let intent = match RenameIntent::parse(&body) {
-                        Ok(i) => i,
-                        Err(e) => { warn!("fs_recover_renames: bad intent {}: {}", key, e); continue; }
-                    };
-                    apply_rename_intent(client, layout, bucket, &intent).await?;
-                    delete_object(client, bucket, key).await?;
-                    recovered += 1;
+                    if key.ends_with(".intent") {
+                        let body = get_object_raw(client, bucket, key).await?;
+                        let intent = match RenameIntent::parse(&body) {
+                            Ok(i) => i,
+                            Err(e) => { warn!("fs_recover_renames: bad intent {}: {}", key, e); continue; }
+                        };
+                        apply_rename_intent(client, layout, bucket, &intent).await?;
+                        delete_object(client, bucket, key).await?;
+                        recovered += 1;
+                    } else if key.ends_with(".reclaim") {
+                        let body = get_object_raw(client, bucket, key).await?;
+                        let ri = match ReclaimIntent::parse(&body) {
+                            Ok(i) => i,
+                            Err(e) => { warn!("fs_recover_renames: bad reclaim {}: {}", key, e); continue; }
+                        };
+                        // Is the displaced child still named dst_name? (scatter-aware)
+                        let still = match Self::fs_open_dir(client, layout, bucket, &ri.dst_parent, FileFlags::rdonly()).await {
+                            Ok(dir) => dir.fs_read_dir().await
+                                .map(|es| es.iter().any(|e| e.name == ri.dst_name && e.uuid == ri.displaced))
+                                .unwrap_or(false),
+                            Err(_) => false,
+                        };
+                        if still {
+                            // Rename hasn't completed: the displaced child is still validly
+                            // named, so don't reclaim. Only clean up a clearly-abandoned
+                            // (stale) intent, to avoid racing an in-flight rename.
+                            if reclaim_intent_stale(key) { delete_object(client, bucket, key).await?; }
+                        } else {
+                            // Rename completed: the displaced child is orphaned. Idempotent.
+                            Self::fs_reclaim(client, layout, bucket, &ri.displaced, ri.displaced_is_dir).await?;
+                            delete_object(client, bucket, key).await?;
+                            recovered += 1;
+                        }
+                    }
                 }
             }
         }
@@ -841,6 +907,67 @@ impl RenameIntent {
             child: child.ok_or_else(|| Error::new(ErrorKind::InvalidData, "intent missing child"))?,
             inode: inode.ok_or_else(|| Error::new(ErrorKind::InvalidData, "intent missing inode"))?,
         })
+    }
+}
+
+/// A reclaim intent for a child displaced by a replace-over-existing rename.
+/// The displaced child's name was overwritten in place (no tombstone), so it
+/// is recorded here durably; recovery reclaims it if the rename completed.
+struct ReclaimIntent {
+    dst_parent: Uuid,
+    dst_name: String,
+    displaced: Uuid,
+    displaced_is_dir: bool,
+}
+
+impl ReclaimIntent {
+    fn serialize(&self) -> String {
+        format!(
+            "dst_parent={}\ndst_name={}\ndisplaced={}\nis_dir={}\n",
+            self.dst_parent,
+            B64.encode(self.dst_name.as_bytes()),
+            self.displaced,
+            self.displaced_is_dir as u8,
+        )
+    }
+
+    fn parse(buf: &[u8]) -> Result<Self> {
+        let s = std::str::from_utf8(buf)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("reclaim not UTF-8: {}", e)))?;
+        let mut dst_parent = None;
+        let mut dst_name = None;
+        let mut displaced = None;
+        let mut is_dir = false;
+        for line in s.lines() {
+            if let Some(v) = line.strip_prefix("dst_parent=") {
+                dst_parent = Some(Uuid::parse_str(v).map_err(|e| Error::new(ErrorKind::InvalidData, format!("reclaim uuid: {}", e)))?);
+            } else if let Some(v) = line.strip_prefix("dst_name=") {
+                let bytes = B64.decode(v).map_err(|e| Error::new(ErrorKind::InvalidData, format!("reclaim b64: {}", e)))?;
+                dst_name = Some(String::from_utf8(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, format!("reclaim name: {}", e)))?);
+            } else if let Some(v) = line.strip_prefix("displaced=") {
+                displaced = Some(Uuid::parse_str(v).map_err(|e| Error::new(ErrorKind::InvalidData, format!("reclaim uuid: {}", e)))?);
+            } else if let Some(v) = line.strip_prefix("is_dir=") {
+                is_dir = v == "1";
+            }
+        }
+        Ok(Self {
+            dst_parent: dst_parent.ok_or_else(|| Error::new(ErrorKind::InvalidData, "reclaim missing dst_parent"))?,
+            dst_name: dst_name.ok_or_else(|| Error::new(ErrorKind::InvalidData, "reclaim missing dst_name"))?,
+            displaced: displaced.ok_or_else(|| Error::new(ErrorKind::InvalidData, "reclaim missing displaced"))?,
+            displaced_is_dir: is_dir,
+        })
+    }
+}
+
+/// Whether a reclaim intent (keyed by `<ulid>.reclaim`) is old enough to be
+/// considered abandoned rather than the in-flight tail of a live rename.
+fn reclaim_intent_stale(key: &str) -> bool {
+    const STALE_MS: i64 = 60_000;
+    let stem = key.rsplit('/').next().unwrap_or(key);
+    let stem = stem.strip_suffix(".reclaim").unwrap_or(stem);
+    match Ulid::from_string(stem) {
+        Ok(u) => unix_now_ms() - (u.timestamp_ms() as i64) > STALE_MS,
+        Err(_) => true,
     }
 }
 
