@@ -13,11 +13,12 @@ use hyperfile::file::hyper::Hyper as HyperFileHandle;
 use hyperfile::config::HyperFileConfigBuilder;
 use hyperfile::config::HyperFileRuntimeConfig;
 use hyperfile::staging::{Staging, config::StagingConfig, s3::S3Staging, StagingIntercept};
+use hyperfile::meta_loader::s3_batch::S3BlockLoader;
 use hyperfile::file::HyperTrait;
 use hyperfile::ondisk::InodeRaw;
 use hyperfile::inode::FlushInodeFlag;
 use crate::hyper::HyperDir;
-use crate::file::{DirFileEntry, CompactStats};
+use crate::file::{DirFileEntry, CompactStats, HyperDirFile};
 use crate::interceptor::ScatterFirstInterceptor;
 use crate::layout::HyperDirLayout;
 use crate::{
@@ -745,6 +746,23 @@ impl<'a> HyperDir<'a>
     {
         debug!("fs_resolve_entry - name: {}", name);
         self.inner.resolve_entry(name).await
+    }
+
+    /// Handle-less single-name resolve: same result as [`fs_resolve_entry`] but
+    /// without first opening a directory handle. The lookup hot path (one call
+    /// per path component) thus avoids the open's redundant inode GET: zero
+    /// inode GETs when the name still has pending scatter, one on the compacted
+    /// fallback (vs. two for open-then-resolve).
+    pub async fn fs_resolve_entry_fast(
+        client: &Client, layout: &HyperDirLayout, bucket: &str, parent_uuid: &Uuid, name: &str,
+    ) -> Result<Option<DirFileEntry>>
+    {
+        let uri = layout.dir_uri(bucket, parent_uuid);
+        let staging_config = StagingConfig::new_s3_uri(&uri, None);
+        let dir_config = S3Staging::to_dir_staging_config(&staging_config);
+        let staging = S3Staging::from(client, dir_config, HyperFileRuntimeConfig::default()).await?;
+        let loader = S3BlockLoader::new(client, &staging.bucket, staging.root_path());
+        HyperDirFile::<S3Staging, S3BlockLoader>::resolve_fast(staging, loader, name).await
     }
 
     pub async fn fs_read_dir(&self) -> Result<Vec<DirFileEntry>>
