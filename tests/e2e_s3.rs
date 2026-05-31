@@ -219,6 +219,12 @@ async fn run_hardlink(client: &Client, bucket: &str, layout: &HyperDirLayout) ->
         assert_eq!(root.fs_read_entry("f2").await?.uuid, f);
     }
 
+    // linking onto an existing name fails with AlreadyExists and must NOT bump
+    // nlink (a failed link never leaves a stale-high count).
+    let dup = HyperDir::fs_link(client, layout, bucket, &ROOT_DIR_UUID, "f2", &f).await;
+    assert_eq!(dup.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists, "duplicate-name link -> AlreadyExists");
+    assert_eq!(file_nlink(client, layout, bucket, &f).await?, 2, "nlink unchanged after failed link");
+
     // unlink f1 (no retention): nlink -> 1, GC must NOT reclaim (f2 still links)
     HyperDir::fs_unlink(client, layout, bucket, &ROOT_DIR_UUID, "f1", &f, false, None).await?;
     {

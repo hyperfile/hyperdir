@@ -419,6 +419,24 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         Ok(())
     }
 
+    /// Like [`insert_entry`] but refuses to overwrite an existing name:
+    /// returns `Ok(false)` if `name` already exists in the latest committed
+    /// bmap. A lost OCC flush race still surfaces as `Err(AlreadyExists)` for
+    /// the caller to retry. Used by hard link so a concurrent same-name link
+    /// cannot clobber the winner (which would also leak the loser's nlink) --
+    /// `insert_entry` reloads-then-upserts, so without this check two racing
+    /// inserts would both "succeed", the later overwriting the earlier.
+    pub async fn insert_entry_excl(&mut self, name: &str, entry: DirFileEntryRaw) -> Result<bool> {
+        self.reload_to_latest().await?;
+        let home = hash_filename(name);
+        if Self::probe_lookup_in(&self.bmap, name.as_bytes(), home).await?.is_some() {
+            return Ok(false); // already present: don't overwrite
+        }
+        self.probe_upsert(name.as_bytes(), entry).await?;
+        self.flush().await?;
+        Ok(true)
+    }
+
     /// Remove the entry named `name` and flush. Returns false if absent.
     pub async fn remove_entry(&mut self, name: &str) -> Result<bool> {
         self.reload_to_latest().await?;
