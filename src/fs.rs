@@ -12,6 +12,7 @@ use hyperfile::file::mode::{FileMode, HyperFileMode};
 use hyperfile::file::hyper::Hyper as HyperFileHandle;
 use hyperfile::config::HyperFileConfigBuilder;
 use hyperfile::config::HyperFileRuntimeConfig;
+use hyperfile::config::FlushConflictPolicy;
 use hyperfile::staging::{Staging, config::StagingConfig, s3::S3Staging, StagingIntercept};
 use hyperfile::meta_loader::s3_batch::S3BlockLoader;
 use hyperfile::file::HyperTrait;
@@ -304,7 +305,13 @@ impl<'a> HyperDir<'a>
         let child_uri = layout.file_uri(bucket, target_file_uuid);
         debug!("fs_link - parent: {}, name: {}, target: {}", parent_dir_uuid, new_name, child_uri);
 
-        let mut parent = Self::fs_open_dir(client, layout, bucket, parent_dir_uuid, FileFlags::rdwr()).await?;
+        // Open the parent with FailFast: a concurrent same-name insert must
+        // surface as AlreadyExists (not be silently overwritten by the default
+        // RetryLastWriterWins flush), so the exclusive insert below can detect
+        // the race and avoid clobbering the winner / leaking nlink.
+        let dir_uri = layout.dir_uri(bucket, parent_dir_uuid);
+        let rc = HyperFileRuntimeConfig { flush_conflict_policy: FlushConflictPolicy::FailFast, ..Default::default() };
+        let mut parent = Self::fs_open_opt(client, &dir_uri, FileFlags::rdwr(), &rc).await?;
         if parent.inner.read_entry(new_name).await.is_ok() {
             return Err(Error::new(ErrorKind::AlreadyExists,
                 format!("link target name exists: {}/{}", parent_dir_uuid, new_name)));
@@ -325,21 +332,40 @@ impl<'a> HyperDir<'a>
         }
 
         // Bump the authoritative nlink (its own OCC retry), then add the new
-        // entry. The insert flush can lose an OCC race with a concurrent
-        // compactor; retry just the insert (re-opening to refresh the inode)
-        // so nlink is bumped exactly once.
+        // entry. Two hazards are handled so a failed/raced link never leaves
+        // the target with a stale-high nlink (a storage leak):
+        //   * a name created concurrently after our initial check must not be
+        //     silently overwritten by the upsert -- re-check the latest dir
+        //     state on every attempt and fail with AlreadyExists;
+        //   * any path that doesn't commit the entry (lost OCC race exhausted,
+        //     a concurrent same-name link, or a transient error) rolls the
+        //     nlink bump back.
+        // The only residual leak is a true process crash between the bump and
+        // the entry commit; that is backstopped by the uuid-level orphan GC.
         let new_nlink = adjust_nlink(client, &child_uri, 1).await?;
         raw_inode.i_nlink = new_nlink;
         let entry = crate::ondisk::DirFileEntryRaw::from(&raw_inode, target_file_uuid.as_bytes(), new_name.as_bytes());
         for _ in 0..NLINK_RETRIES {
-            match parent.inner.insert_entry(new_name, entry).await {
-                Ok(()) => return Ok(()),
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    parent = Self::fs_open_dir(client, layout, bucket, parent_dir_uuid, FileFlags::rdwr()).await?;
+            match parent.inner.insert_entry_excl(new_name, entry).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    // The name was claimed by a concurrent op; undo our bump.
+                    let _ = adjust_nlink(client, &child_uri, -1).await;
+                    return Err(Error::new(ErrorKind::AlreadyExists,
+                        format!("link target name exists: {}/{}", parent_dir_uuid, new_name)));
                 },
-                Err(e) => return Err(e),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    // Lost the dir-inode OCC race; re-open and retry (the
+                    // exclusive insert re-checks presence on the latest state).
+                    parent = Self::fs_open_opt(client, &dir_uri, FileFlags::rdwr(), &rc).await?;
+                },
+                Err(e) => {
+                    let _ = adjust_nlink(client, &child_uri, -1).await; // undo our bump
+                    return Err(e);
+                },
             }
         }
+        let _ = adjust_nlink(client, &child_uri, -1).await; // undo our bump
         Err(Error::new(ErrorKind::ResourceBusy, "fs_link: too many OCC conflicts"))
     }
 
