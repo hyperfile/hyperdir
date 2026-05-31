@@ -460,3 +460,97 @@ async fn run_rename_recovery(client: &Client, bucket: &str, layout: &HyperDirLay
     assert_eq!(n2, 0, "no intents left on second recovery");
     Ok(())
 }
+
+
+/// Crash recovery, harder case: a crash AFTER the destination-add but BEFORE
+/// the source-remove leaves the child reachable under both the source and the
+/// destination name (nlink still 1). fs_recover_renames must converge to the
+/// single destination name -- the dangerous transient state same-source C1
+/// guards against, here reached via a half-applied rename.
+#[tokio::test]
+#[ignore]
+async fn e2e_rename_crash_partial_apply() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let result = run_rename_partial_apply(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    result.expect("rename partial-apply recovery flow");
+}
+
+async fn run_rename_partial_apply(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    let _root = HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    let (_a, ua) = HyperDir::fs_create_default(client, layout, bucket, &ROOT_DIR_UUID, "A", FileFlags::rdwr(), dir_mode()).await?;
+    let (_b, ub) = HyperDir::fs_create_default(client, layout, bucket, &ROOT_DIR_UUID, "B", FileFlags::rdwr(), dir_mode()).await?;
+    { let mut r = HyperDir::fs_open_root(client, layout, bucket, FileFlags::rdwr()).await?; r.fs_compact().await?; }
+    let ux = create_file(client, layout, bucket, &ua, "x").await?;
+    { let mut a = HyperDir::fs_open_dir(client, layout, bucket, &ua, FileFlags::rdwr()).await?; a.fs_compact().await?; }
+
+    // crash injection: add to destination, do NOT remove from source.
+    HyperDir::fs_rename_apply_partial(client, layout, bucket, &ua, "x", &ub, "y").await?;
+
+    // mid-crash state: x still in A and y already in B (one child, two names).
+    {
+        let a = HyperDir::fs_open_dir(client, layout, bucket, &ua, FileFlags::rdonly()).await?;
+        assert!(names(&a.fs_read_dir().await?).contains("x"), "x still in A pre-recovery");
+        let b = HyperDir::fs_open_dir(client, layout, bucket, &ub, FileFlags::rdonly()).await?;
+        assert!(names(&b.fs_read_dir().await?).contains("y"), "y already in B pre-recovery");
+    }
+    assert_eq!(file_nlink(client, layout, bucket, &ux).await?, 1, "nlink unchanged by a move");
+
+    let n = HyperDir::fs_recover_renames(client, layout, bucket).await?;
+    assert!(n >= 1, "recovered the half-applied rename, got {}", n);
+
+    {
+        let mut a = HyperDir::fs_open_dir(client, layout, bucket, &ua, FileFlags::rdwr()).await?;
+        a.fs_compact().await?;
+        assert!(!names(&a.fs_read_dir().await?).contains("x"), "x removed from A after recovery");
+        let b = HyperDir::fs_open_dir(client, layout, bucket, &ub, FileFlags::rdonly()).await?;
+        assert_eq!(b.fs_read_entry("y").await?.uuid, ux, "y in B resolves to the moved child");
+    }
+    assert_eq!(file_nlink(client, layout, bucket, &ux).await?, 1, "still exactly one link after recovery");
+    Ok(())
+}
+
+/// Crash recovery of a replace-over-existing reclaim: the rename overwrote a
+/// destination, recorded the displaced (now nameless) child in a `.reclaim`
+/// intent, then crashed before reclaiming it. fs_recover_renames must reclaim
+/// the orphan's storage. (And when the displaced name still resolves to it --
+/// the rename never completed -- recovery must NOT reclaim.)
+#[tokio::test]
+#[ignore]
+async fn e2e_reclaim_intent_recovery() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let result = run_reclaim_intent_recovery(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    result.expect("reclaim intent recovery flow");
+}
+
+async fn run_reclaim_intent_recovery(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    let _root = HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+
+    // Case 1: the displaced name still resolves to the child -> NOT reclaimed.
+    let kept = create_file(client, layout, bucket, &ROOT_DIR_UUID, "kept").await?;
+    { let mut r = HyperDir::fs_open_root(client, layout, bucket, FileFlags::rdwr()).await?; r.fs_compact().await?; }
+    let _ = HyperDir::fs_emit_reclaim_intent(client, layout, bucket, &ROOT_DIR_UUID, "kept", &kept, false).await?;
+    HyperDir::fs_recover_renames(client, layout, bucket).await?;
+    assert!(file_exists(client, layout, bucket, &kept).await, "a still-named child is not reclaimed");
+
+    // Case 2: an orphaned (nameless, nlink 0) displaced child -> reclaimed.
+    let orphan = create_file(client, layout, bucket, &ROOT_DIR_UUID, "tmp").await?;
+    { let mut r = HyperDir::fs_open_root(client, layout, bucket, FileFlags::rdwr()).await?; r.fs_compact().await?; }
+    HyperDir::fs_unlink(client, layout, bucket, &ROOT_DIR_UUID, "tmp", &orphan, false, None).await?;
+    { let mut r = HyperDir::fs_open_root(client, layout, bucket, FileFlags::rdwr()).await?; r.fs_compact().await?; } // nlink -> 0, nameless
+    let _ = HyperDir::fs_emit_reclaim_intent(client, layout, bucket, &ROOT_DIR_UUID, "victim", &orphan, false).await?;
+    let n = HyperDir::fs_recover_renames(client, layout, bucket).await?;
+    assert!(n >= 1, "recovered the reclaim intent, got {}", n);
+    assert!(!file_exists(client, layout, bucket, &orphan).await, "the orphaned displaced child is reclaimed");
+
+    // idempotent: a second pass finds nothing left.
+    assert_eq!(HyperDir::fs_recover_renames(client, layout, bucket).await?, 0, "no intents left on second recovery");
+    Ok(())
+}

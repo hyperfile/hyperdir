@@ -934,6 +934,34 @@ impl<'a> HyperDir<'a>
         Ok(())
     }
 
+    /// Test-only: pre-check a cross-directory rename, write the intent, and
+    /// apply ONLY the destination-add -- i.e. simulate a crash after the child
+    /// is added to the destination but before it is removed from the source, so
+    /// it is momentarily reachable under both names. `fs_recover_renames` must
+    /// complete the move (idempotently re-adding the destination and removing
+    /// the source), converging to the single destination name.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fs_rename_apply_partial(
+        client: &Client,
+        layout: &HyperDirLayout,
+        bucket: &str,
+        src_parent_uuid: &Uuid,
+        src_name: &str,
+        dst_parent_uuid: &Uuid,
+        dst_name: &str,
+    ) -> Result<()>
+    {
+        let (_key, intent) = emit_rename_intent(
+            client, layout, bucket, src_parent_uuid, src_name, dst_parent_uuid, dst_name).await?;
+        // Destination-add only (the first half of apply_rename_intent).
+        let inode_raw = InodeRaw::from_u8_slice(&intent.inode);
+        let entry = crate::ondisk::DirFileEntryRaw::from(&inode_raw, intent.child.as_bytes(), intent.dst_name.as_bytes());
+        let mut dst = Self::fs_open_dir(client, layout, bucket, &intent.dst_parent, FileFlags::rdwr()).await?;
+        dst.inner.insert_entry(&intent.dst_name, entry).await?;
+        Ok(())
+    }
+
     /// Re-drive any rename intents left behind by an interrupted
     /// [`fs_rename_across`] (e.g. a crash between the commit and the intent
     /// delete). Each intent's forward steps are idempotent, so re-applying a
