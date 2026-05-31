@@ -391,7 +391,13 @@ or an exclusive claim, makes them safe — never atomic across objects):
 - CRC64 collision (two names in one slot, both resolvable, survive deletion of
   the other);
 - cross-directory rename crash recovery (intent committed, not applied;
-  `fs_recover_renames` completes it).
+  `fs_recover_renames` completes it);
+- cross-directory rename crash recovery, half-applied (destination added before
+  the source was removed — the child momentarily under both names; recovery
+  converges to the single destination name);
+- reclaim-intent crash recovery (a replace-over-existing rename recorded the
+  displaced child in a `.reclaim` intent then crashed; recovery reclaims the
+  orphan, and leaves a still-named child untouched).
 
 `tests/e2e_concurrent.rs` (same prerequisites) drives several operations
 concurrently against one shared namespace and asserts interleaving-invariant
