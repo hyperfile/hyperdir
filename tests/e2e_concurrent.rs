@@ -17,7 +17,8 @@
 
 use aws_sdk_s3::Client;
 use uuid::Uuid;
-use hyperdir::{HyperDirLayout, ROOT_DIR_UUID, ScatterFirstInterceptor};
+use std::time::Duration;
+use hyperdir::{HyperDirLayout, ROOT_DIR_UUID, ScatterFirstInterceptor, LockKind, SetLkOutcome, DEFAULT_LOCK_TTL_MS};
 use hyperdir::hyper::HyperDir;
 use hyperfile::file::flags::FileFlags;
 use hyperfile::file::mode::FileMode;
@@ -262,5 +263,399 @@ async fn run_concurrent_mkdir(client: &Client, bucket: &str, layout: &HyperDirLa
     let _ = tokio::join!(mkdir(), mkdir());
     let names = dir_names(client, layout, bucket, &ROOT_DIR_UUID).await;
     assert_eq!(names.iter().filter(|n| *n == "d").count(), 1, "exactly one entry named d, got {:?}", names);
+    Ok(())
+}
+
+
+/// How many times each test repeats its racy core. The dangerous interleavings
+/// are rare windows, so a single shot is weak evidence; loop to shake them out.
+const RACES: usize = 5;
+
+/// Foreground mutation racing an in-progress `fs_compact` of the same dir — the
+/// central interleaving of the scatter/compact model. An unlink's tombstone
+/// and a create's scatter must each be folded exactly once regardless of
+/// whether the racing compact runs before, during, or after they land: the
+/// unlinked name's nlink drops by exactly one (never lost, never doubled), and
+/// the created name is never lost to a compact that listed just before it.
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_op_vs_compact() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_op_vs_compact(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("op vs compact flow");
+}
+
+async fn run_op_vs_compact(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    for i in 0..RACES {
+        let (a, b, c) = (format!("a{i}"), format!("b{i}"), format!("c{i}"));
+        let f = create_file(client, layout, bucket, &ROOT_DIR_UUID, &a).await?;
+        HyperDir::fs_link(client, layout, bucket, &ROOT_DIR_UUID, &b, &f).await?; // nlink 2
+        compact_root(client, layout, bucket).await?;
+
+        // unlink "a{i}" racing a compact, and concurrently create "c{i}" racing
+        // the same compact.
+        let u = {
+            let (client, layout, bucket, a) = (client.clone(), layout.clone(), bucket.to_string(), a.clone());
+            async move { HyperDir::fs_unlink(&client, &layout, &bucket, &ROOT_DIR_UUID, &a, &f, false, None).await }
+        };
+        let mk = create_file(client, layout, bucket, &ROOT_DIR_UUID, &c);
+        let (ru, rmk, _rc) = tokio::join!(u, mk, compact_root(client, layout, bucket));
+        ru?; let cu = rmk?;
+        compact_root(client, layout, bucket).await?; // settle any tombstone/scatter not yet folded
+
+        let names = dir_names(client, layout, bucket, &ROOT_DIR_UUID).await;
+        assert!(!names.contains(&a), "unlinked name gone after compact race: {names:?}");
+        assert!(names.contains(&b), "surviving link kept: {names:?}");
+        assert!(names.contains(&c), "created name not lost to a racing compact: {names:?}");
+        assert_eq!(resolve(client, layout, bucket, &ROOT_DIR_UUID, &c).await, Some(cu), "created name resolves");
+        assert_eq!(file_nlink(client, layout, bucket, &f).await, 1, "exactly-once nlink dec under compact race");
+    }
+    Ok(())
+}
+
+/// `fs_gc_orphans` racing an in-flight create. A create writes `FILE/<uuid>`
+/// before it scatters the name, so for a moment the file is unreferenced; the
+/// orphan sweep must not reclaim it. With a sane grace window a just-created
+/// file always survives — this guards the grace backstop that stands between
+/// orphan GC and brand-new files (a regression here is silent data loss).
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_orphan_gc_vs_create() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_orphan_gc_vs_create(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("orphan gc vs create flow");
+}
+
+async fn run_orphan_gc_vs_create(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    for i in 0..RACES {
+        let name = format!("g{i}");
+        // Generous grace: a young in-flight create must be protected even when
+        // the sweep observes it unreferenced.
+        let gc = HyperDir::fs_gc_orphans(client, layout, bucket, Duration::from_secs(3600));
+        let mk = create_file(client, layout, bucket, &ROOT_DIR_UUID, &name);
+        let (rmk, rgc) = tokio::join!(mk, gc);
+        let cu = rmk?;
+        rgc?;
+        compact_root(client, layout, bucket).await?;
+        assert_eq!(resolve(client, layout, bucket, &ROOT_DIR_UUID, &name).await, Some(cu),
+            "in-flight create survives a concurrent orphan sweep");
+        assert_eq!(file_nlink(client, layout, bucket, &cu).await, 1, "created file still has its inode");
+    }
+    Ok(())
+}
+
+/// Mixed link + unlink on the SAME target via different names, concurrently.
+/// link bumps nlink eagerly while unlink defers its decrement to compaction
+/// (Scheme A), so the net must still be exact: starting at nlink 3, one
+/// concurrent unlink and one concurrent link leave nlink 3 after compaction
+/// (-1 +1), with the unlinked name gone and the linked name present.
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_link_unlink_nlink() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_link_unlink_nlink(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("link/unlink nlink flow");
+}
+
+async fn run_link_unlink_nlink(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    for i in 0..RACES {
+        let (x, y, z, w) = (format!("x{i}"), format!("y{i}"), format!("z{i}"), format!("w{i}"));
+        let f = create_file(client, layout, bucket, &ROOT_DIR_UUID, &x).await?; // nlink 1
+        HyperDir::fs_link(client, layout, bucket, &ROOT_DIR_UUID, &y, &f).await?; // 2
+        HyperDir::fs_link(client, layout, bucket, &ROOT_DIR_UUID, &z, &f).await?; // 3
+        compact_root(client, layout, bucket).await?;
+        assert_eq!(file_nlink(client, layout, bucket, &f).await, 3, "three links before race");
+
+        let u = {
+            let (client, layout, bucket, x) = (client.clone(), layout.clone(), bucket.to_string(), x.clone());
+            async move { HyperDir::fs_unlink(&client, &layout, &bucket, &ROOT_DIR_UUID, &x, &f, false, None).await }
+        };
+        let l = {
+            let (client, layout, bucket, w) = (client.clone(), layout.clone(), bucket.to_string(), w.clone());
+            async move { HyperDir::fs_link(&client, &layout, &bucket, &ROOT_DIR_UUID, &w, &f).await }
+        };
+        let (ru, rl) = tokio::join!(u, l);
+        ru?; rl?;
+        compact_root(client, layout, bucket).await?;
+
+        let names = dir_names(client, layout, bucket, &ROOT_DIR_UUID).await;
+        assert!(!names.contains(&x), "unlinked name gone: {names:?}");
+        for n in [&y, &z, &w] { assert!(names.contains(n), "link {n} present: {names:?}"); }
+        assert_eq!(file_nlink(client, layout, bucket, &f).await, 3, "net nlink after -1 unlink +1 link is exact");
+    }
+    Ok(())
+}
+
+
+/// Compact an arbitrary directory (the root helper only does root).
+async fn compact_dir(client: &Client, layout: &HyperDirLayout, bucket: &str, dir: &Uuid) -> std::io::Result<()> {
+    let mut d = HyperDir::fs_open_dir(client, layout, bucket, dir, FileFlags::rdwr()).await?;
+    let _ = d.fs_compact().await?;
+    Ok(())
+}
+async fn mkdir(client: &Client, layout: &HyperDirLayout, bucket: &str, parent: &Uuid, name: &str) -> std::io::Result<Uuid> {
+    HyperDir::fs_create_default(client, layout, bucket, parent, name, FileFlags::rdwr(), dir_mode()).await.map(|(_, u)| u)
+}
+/// getattr that doesn't panic: Some(nlink) if the file exists, None if gone.
+async fn maybe_nlink(client: &Client, layout: &HyperDirLayout, bucket: &str, uuid: &Uuid) -> Option<u64> {
+    HyperDir::fs_getattr_fast(client, &layout.file_uri(bucket, uuid)).await.ok().map(|st| st.st_nlink)
+}
+
+/// Two clients concurrently recovering the SAME committed-but-unapplied
+/// cross-directory rename intent (a crash left it behind). Recovery is forward
+/// + idempotent, so racing recoverers must converge: the source is gone, the
+/// destination resolves to the same file, nlink is unchanged, and no
+/// double-apply corrupts the namespace.
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_recover_renames() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_recover_renames(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("concurrent recover flow");
+}
+
+async fn run_recover_renames(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    let d1 = mkdir(client, layout, bucket, &ROOT_DIR_UUID, "d1").await?;
+    let d2 = mkdir(client, layout, bucket, &ROOT_DIR_UUID, "d2").await?;
+    compact_root(client, layout, bucket).await?;
+    for i in 0..RACES {
+        let (s, t) = (format!("s{i}"), format!("t{i}"));
+        let f = create_file(client, layout, bucket, &d1, &s).await?;
+        compact_dir(client, layout, bucket, &d1).await?;
+        // Crash right after the commit point: intent written, not applied.
+        HyperDir::fs_rename_emit_intent_only(client, layout, bucket, &d1, &s, &d2, &t).await?;
+
+        let rec = || {
+            let (client, layout, bucket) = (client.clone(), layout.clone(), bucket.to_string());
+            async move { HyperDir::fs_recover_renames(&client, &layout, &bucket).await }
+        };
+        let (a, b) = tokio::join!(rec(), rec());
+        a?; b?;
+        compact_dir(client, layout, bucket, &d1).await?;
+        compact_dir(client, layout, bucket, &d2).await?;
+
+        assert!(!dir_names(client, layout, bucket, &d1).await.contains(&s), "source gone from d1");
+        assert_eq!(resolve(client, layout, bucket, &d2, &t).await, Some(f), "dest resolves to the moved file");
+        assert_eq!(file_nlink(client, layout, bucket, &f).await, 1, "recovery leaves nlink unchanged");
+    }
+    Ok(())
+}
+
+/// Concurrent `fs_reclaim` of the same child. Reclaim must (a) refuse a file
+/// still hard-linked elsewhere (nlink > 1) and (b) be idempotent for a truly
+/// orphaned one (nlink <= 1) — reclaim exactly once, the second call a no-op.
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_reclaim() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_reclaim(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("concurrent reclaim flow");
+}
+
+async fn run_reclaim(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    let reclaim = |u: Uuid| {
+        let (client, layout, bucket) = (client.clone(), layout.clone(), bucket.to_string());
+        async move { HyperDir::fs_reclaim(&client, &layout, &bucket, &u, false).await }
+    };
+    for i in 0..RACES {
+        // (a) guard: a hard-linked file (nlink 2) must NOT be reclaimed.
+        let keep = create_file(client, layout, bucket, &ROOT_DIR_UUID, &format!("k{i}")).await?;
+        HyperDir::fs_link(client, layout, bucket, &ROOT_DIR_UUID, &format!("k{i}b"), &keep).await?;
+        compact_root(client, layout, bucket).await?;
+        let (ka, kb) = tokio::join!(reclaim(keep), reclaim(keep));
+        ka?; kb?;
+        assert_eq!(maybe_nlink(client, layout, bucket, &keep).await, Some(2), "linked file not reclaimed");
+
+        // (b) idempotent: an orphaned file (its only name unlinked -> nlink 0).
+        let orphan = create_file(client, layout, bucket, &ROOT_DIR_UUID, &format!("o{i}")).await?;
+        compact_root(client, layout, bucket).await?;
+        HyperDir::fs_unlink(client, layout, bucket, &ROOT_DIR_UUID, &format!("o{i}"), &orphan, false, None).await?;
+        compact_root(client, layout, bucket).await?; // nlink -> 0
+        let (oa, ob) = tokio::join!(reclaim(orphan), reclaim(orphan));
+        oa?; ob?;
+        assert_eq!(maybe_nlink(client, layout, bucket, &orphan).await, None, "orphan reclaimed exactly once");
+    }
+    Ok(())
+}
+
+/// Two identical cross-directory renames racing. The intent commit + idempotent
+/// forward apply make this safe: the namespace converges (source gone, dest
+/// resolves to the file, nlink unchanged) whether both apply or the loser sees
+/// the source already moved.
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_rename_across() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_rename_across(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("concurrent rename_across flow");
+}
+
+async fn run_rename_across(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    let d1 = mkdir(client, layout, bucket, &ROOT_DIR_UUID, "a1").await?;
+    let d2 = mkdir(client, layout, bucket, &ROOT_DIR_UUID, "a2").await?;
+    compact_root(client, layout, bucket).await?;
+    for i in 0..RACES {
+        let (s, t) = (format!("s{i}"), format!("t{i}"));
+        let f = create_file(client, layout, bucket, &d1, &s).await?;
+        compact_dir(client, layout, bucket, &d1).await?;
+        let across = || {
+            let (client, layout, bucket, s, t) = (client.clone(), layout.clone(), bucket.to_string(), s.clone(), t.clone());
+            async move { HyperDir::fs_rename_across(&client, &layout, &bucket, &d1, &s, &d2, &t).await }
+        };
+        let (_a, _b) = tokio::join!(across(), across()); // one may Ok, the other AlreadyExists/NotFound
+        compact_dir(client, layout, bucket, &d1).await?;
+        compact_dir(client, layout, bucket, &d2).await?;
+
+        assert!(!dir_names(client, layout, bucket, &d1).await.contains(&s), "source gone from a1");
+        assert_eq!(resolve(client, layout, bucket, &d2, &t).await, Some(f), "dest resolves to the file");
+        assert_eq!(file_nlink(client, layout, bucket, &f).await, 1, "cross-dir rename leaves nlink unchanged");
+    }
+    Ok(())
+}
+
+/// Concurrent create-vs-unlink of the SAME name (distinct uuids). The merged
+/// view must stay consistent: at most one entry for the name, and if present it
+/// resolves to a live file (no dangling entry pointing at a reclaimed uuid).
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_create_vs_unlink() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_create_vs_unlink(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("create vs unlink flow");
+}
+
+async fn run_create_vs_unlink(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    for i in 0..RACES {
+        let p = format!("p{i}");
+        let old = create_file(client, layout, bucket, &ROOT_DIR_UUID, &p).await?; // pre-existing entry
+        compact_root(client, layout, bucket).await?;
+        let u = {
+            let (client, layout, bucket, p) = (client.clone(), layout.clone(), bucket.to_string(), p.clone());
+            async move { HyperDir::fs_unlink(&client, &layout, &bucket, &ROOT_DIR_UUID, &p, &old, false, None).await }
+        };
+        let mk = create_file(client, layout, bucket, &ROOT_DIR_UUID, &p); // new uuid, same name
+        let (ru, rmk) = tokio::join!(u, mk);
+        ru?; rmk?;
+        compact_root(client, layout, bucket).await?;
+
+        let names = dir_names(client, layout, bucket, &ROOT_DIR_UUID).await;
+        assert!(names.iter().filter(|n| **n == p).count() <= 1, "at most one entry named {p}: {names:?}");
+        if let Some(u) = resolve(client, layout, bucket, &ROOT_DIR_UUID, &p).await {
+            assert!(maybe_nlink(client, layout, bucket, &u).await.is_some(), "{p} resolves to a live file, not a dangling entry");
+        }
+    }
+    Ok(())
+}
+
+/// Concurrent xattr writes: same-name writes are last-write-wins (the value
+/// reads back as one of the two, never corrupt/missing), and writes to
+/// different names are independent (both persist) since each is its own sidecar.
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_xattr() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_xattr(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("concurrent xattr flow");
+}
+
+async fn run_xattr(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    let f = create_file(client, layout, bucket, &ROOT_DIR_UUID, "xf").await?;
+    for i in 0..RACES {
+        let k = format!("user.k{i}");
+        // same name, two values -> last-write-wins, reads back as one of them.
+        let (ra, rb) = tokio::join!(
+            HyperDir::fs_setxattr(client, layout, bucket, &f, false, &k, b"A"),
+            HyperDir::fs_setxattr(client, layout, bucket, &f, false, &k, b"B"),
+        );
+        ra?; rb?;
+        let v = HyperDir::fs_getxattr(client, layout, bucket, &f, false, &k).await?.expect("xattr set");
+        assert!(v == b"A" || v == b"B", "same-name xattr is one of the racers, got {v:?}");
+
+        // distinct names -> independent sidecars, both persist.
+        let (k1, k2) = (format!("user.m{i}"), format!("user.n{i}"));
+        let (r1, r2) = tokio::join!(
+            HyperDir::fs_setxattr(client, layout, bucket, &f, false, &k1, b"1"),
+            HyperDir::fs_setxattr(client, layout, bucket, &f, false, &k2, b"2"),
+        );
+        r1?; r2?;
+        assert_eq!(HyperDir::fs_getxattr(client, layout, bucket, &f, false, &k1).await?.as_deref(), Some(&b"1"[..]));
+        assert_eq!(HyperDir::fs_getxattr(client, layout, bucket, &f, false, &k2).await?.as_deref(), Some(&b"2"[..]));
+    }
+    Ok(())
+}
+
+/// Two distinct owners racing for an overlapping WRITE byte-range lock on the
+/// same file: the S3 OCC binding must grant exactly one (the other gets a
+/// Conflict), never both. After the winner releases, the other can acquire.
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_locks() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_locks(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("concurrent lock flow");
+}
+
+async fn run_locks(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    let f = create_file(client, layout, bucket, &ROOT_DIR_UUID, "lf").await?;
+    let setlk = |owner: &'static str| {
+        let (client, layout, bucket) = (client.clone(), layout.clone(), bucket.to_string());
+        async move {
+            HyperDir::fs_setlk(&client, &layout, &bucket, &f, false, owner,
+                LockKind::Write, 0, 100, 1, DEFAULT_LOCK_TTL_MS).await
+        }
+    };
+    for _ in 0..RACES {
+        let (a, b) = tokio::join!(setlk("o1"), setlk("o2"));
+        let granted = [a?, b?].into_iter().filter(|o| *o == SetLkOutcome::Granted).count();
+        assert_eq!(granted, 1, "exactly one owner is granted an overlapping write lock");
+        // release both owners so the next iteration starts clean.
+        HyperDir::fs_unlock_owner(client, layout, bucket, &f, false, "o1").await?;
+        HyperDir::fs_unlock_owner(client, layout, bucket, &f, false, "o2").await?;
+    }
     Ok(())
 }
