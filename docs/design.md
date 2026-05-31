@@ -212,7 +212,13 @@ the child prefix.
   nameless files no tombstone covers (e.g. a create+unlink before any compact,
   or a hard-linked child displaced by a replace-over-existing rename).
 - `fs_rmdir`: verify the child directory is empty via `read_dir`
-  (`DirectoryNotEmpty` otherwise), then `fs_unlink` it.
+  (`DirectoryNotEmpty` otherwise), then `fs_unlink` it. The check and the
+  tombstone aren't atomic, so the semantics is best-effort: a create into the
+  child that races the final window isn't seen, rmdir succeeds, and that child
+  becomes a nameless orphan reclaimed by the GC chain (`fs_gc` removes the dir,
+  then `fs_gc_orphans` the child) — never a leak or a dangling entry. Strict
+  ENOTEMPTY-always would need a per-directory seal checked by every entry-add
+  path (not implemented).
 - `nlink` is authoritative in the child inode; `adjust_nlink` uses a
   no-interceptor staging (no scatter) with OCC retry.
 
@@ -280,7 +286,68 @@ acquisition is not implemented; the caller treats setlk as non-blocking. The
 `_lock` object lives under the child's prefix, so it is reclaimed automatically
 when the prefix is deleted (unlink / GC need no change).
 
-## 11. Known limitations (PoC)
+## 11. Consistency model (non-atomic, eventual, and advisory behaviors)
+
+S3 offers no multi-object transaction and no lock, only single-object strong
+read-after-write and conditional writes. Hyperdir therefore builds every
+multi-step operation on a **single durable commit point** plus deferred,
+idempotent follow-up work, and accepts a number of eventual / advisory
+behaviors. They are detailed in the sections above; collected here so the
+overall model is visible in one place.
+
+**Exactly-once / serialization primitives** (what correctness rests on):
+
+- Single-object **conditional writes** (`If-None-Match: *` / `If-Match: <etag>`)
+  are the commit primitive for every scatter object, the rename/reclaim
+  intents, the compactor lease, and the lock table.
+- **Per-inode OCC** (hyperfile flush): two writers of one inode yield one `Ok`
+  and one `AlreadyExists`.
+- **Per-directory compactor lease** (§7): the single serialized fold point, so
+  the nlink decrement and tombstone creation a delete needs are exactly-once
+  even under concurrent/duplicate unlinks (§8).
+- **Source-scoped rename claim** (§9): concurrent renames of one source admit
+  exactly one winner (move-once), the cross-directory analogue of same-dir
+  rename's single OCC flush.
+
+**Non-atomic operations** (a single commit point + idempotent forward recovery,
+or an exclusive claim, makes them safe — never atomic across objects):
+
+- **scatter → compact** (§5, §7): a mutation's durable commit is its scatter
+  object; folding it into the B-tree is deferred to `compact`. Reads merge
+  scatter over the bmap (§6), so they are correct before the fold.
+- **Two-phase delete** (§8): `fs_unlink` emits a cheap `PreDelete`; compaction
+  later reads the child inode, writes the real tombstone, and decrements nlink.
+- **Cross-directory rename** (§9): spans two parents; a source-scoped intent is
+  the commit point, forward-applied (dest-add before src-remove) and recovered
+  idempotently by `fs_recover_renames`.
+- **Replace-over-existing rename** (§9): the displaced child's reclaim is a
+  separate step recorded by a `.reclaim` intent and completed by recovery.
+- **Hard link** (§9): nlink bump + entry insert; exclusive insert + nlink
+  rollback keep a raced/failed link clean.
+- **rmdir** (§8): empty-check + tombstone; best-effort (ENOTEMPTY if the child
+  is visible, else the racing child is orphaned and GC-reclaimed).
+
+**Eventual** (converges within a maintenance-loop interval):
+
+- **nlink** reflects an unlink only after the parent is compacted (§8).
+- **Storage reclaim** lags the namespace: a name disappears at once, but the
+  child prefix is reclaimed by `fs_gc` after retention, and nameless orphans by
+  `fs_gc_orphans` after a grace window (§8).
+- **A crashed holder's advisory locks** free on TTL expiry; **a dead
+  compactor's lease** is reclaimed after its TTL (§7, §10).
+
+**Advisory / best-effort replicas** (authority lies elsewhere; may lag):
+
+- The **inode cached in a directory entry** (size/mode/times/nlink) is an
+  advisory readdir/stat snapshot; authority is the child's own inode (§6) —
+  notably `nlink` for hard-linked files.
+- A **child's own inode object** is a best-effort replica of the authoritative
+  parent scatter; it self-heals via hyperfile's `refresh_bmap` (§5).
+- **`read_dir`** is a snapshot as of its LIST/GET round-trips, not a
+  point-in-time view of the whole tree; two calls may differ if writers commit
+  between them (§6).
+
+## 12. Known limitations (PoC)
 
 - Hard link still has a pre-check-vs-commit TOCTOU window, but it cannot lose
   data: `fs_link`'s exclusive insert + nlink rollback make a raced link fail
@@ -299,7 +366,7 @@ when the prefix is deleted (unlink / GC need no change).
 - `inode_mut` relies on a `&self -> &mut Inode` transmute inherited from the
   `hyperfile` trait surface; to be addressed upstream.
 
-## 12. Engineering constraints
+## 13. Engineering constraints
 
 - The B-tree root is a fixed 56-byte inline area in the inode, but a directory
   entry is ~432 bytes, so the root must be an internal node from the first
@@ -311,7 +378,7 @@ when the prefix is deleted (unlink / GC need no change).
   exceed the default ~2 MiB test-thread stack — a frame-size issue, not
   recursion. Use a large `RUST_MIN_STACK` (e.g. 64 MiB) or a release build.
 
-## 13. Tests
+## 14. Tests
 
 `tests/e2e_s3.rs` (`#[ignore]`, requires real S3 credentials + `S3_BUCKET` /
 `S3_REGION` + a large `RUST_MIN_STACK`) covers, end to end:
@@ -350,5 +417,8 @@ properties (every interleaving must satisfy them, not a specific winner):
 - concurrent `fs_reclaim` — a file with `nlink>1` is refused, an orphan is
   reclaimed exactly once;
 - create vs unlink of one name — at most one entry, never a dangling resolve;
+- rmdir racing a create into the same directory — either `DirectoryNotEmpty`
+  (dir + child consistent) or rmdir wins and the orphaned child is reclaimed by
+  the GC chain (no leak, no dangling);
 - concurrent xattr (same-name last-write-wins, distinct names independent) and
   contended overlapping write locks (S3 OCC grants exactly one owner).

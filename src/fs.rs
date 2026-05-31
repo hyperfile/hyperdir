@@ -354,10 +354,14 @@ impl<'a> HyperDir<'a>
     /// tombstone into the parent exactly like [`fs_unlink`], so physical
     /// reclamation is deferred to [`fs_gc`] under `retention`.
     ///
-    /// The emptiness check and the tombstone are not atomic: an entry created
-    /// in the child between the two steps can be lost. A caller that needs
-    /// strict semantics must serialize rmdir against creates under the child
-    /// (a higher-layer concern).
+    /// The emptiness check and the tombstone are not atomic. The semantics is
+    /// best-effort: a create into the child that lands in the window between
+    /// the check and the tombstone is not seen, so rmdir succeeds and that
+    /// child becomes a nameless orphan -- reclaimed by the GC chain (`fs_gc`
+    /// removes this directory, then `fs_gc_orphans` the child), never a
+    /// permanent leak or a dangling entry. A create visible at check time
+    /// yields `DirectoryNotEmpty`. Strict ENOTEMPTY-always would require a
+    /// per-directory seal checked by every entry-add path (not implemented).
     pub async fn fs_rmdir(
         client: &Client,
         layout: &HyperDirLayout,

@@ -710,3 +710,54 @@ async fn run_rename_across_distinct(client: &Client, bucket: &str, layout: &Hype
     }
     Ok(())
 }
+
+/// C2: rmdir racing a create INTO the same directory. rmdir's emptiness check
+/// and its tombstone aren't atomic, so a create landing in the final window
+/// isn't seen. The defined semantics is best-effort: either rmdir sees the
+/// child and fails (DirectoryNotEmpty, the directory and child survive
+/// consistently), or rmdir wins and the racing child becomes a nameless orphan
+/// that the GC chain (fs_gc reclaims the dir, then fs_gc_orphans the child)
+/// reclaims -- never a permanent leak and never a dangling entry.
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_rmdir_vs_create() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_rmdir_vs_create(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("rmdir vs create flow");
+}
+
+async fn run_rmdir_vs_create(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    for i in 0..RACES {
+        let name = format!("d{i}");
+        let d = mkdir(client, layout, bucket, &ROOT_DIR_UUID, &name).await?;
+        compact_root(client, layout, bucket).await?;
+
+        let rm = {
+            let (client, layout, bucket, name) = (client.clone(), layout.clone(), bucket.to_string(), name.clone());
+            async move { HyperDir::fs_rmdir(&client, &layout, &bucket, &ROOT_DIR_UUID, &name, &d, None).await }
+        };
+        let mk = create_file(client, layout, bucket, &d, "c");
+        let (rr, child) = tokio::join!(rm, mk);
+        let child = child?; // create always commits the file + its scatter into d
+        compact_root(client, layout, bucket).await?; // fold rmdir's removal of d, if it happened
+
+        if dir_names(client, layout, bucket, &ROOT_DIR_UUID).await.contains(&name) {
+            // rmdir saw the child -> failed; d and its child survive consistently.
+            assert!(rr.is_err(), "d still present, so rmdir must have failed");
+            assert!(dir_names(client, layout, bucket, &d).await.contains(&"c".to_string()), "child consistent under d");
+            assert!(maybe_nlink(client, layout, bucket, &child).await.is_some(), "child file present");
+        } else {
+            // rmdir won -> the racing child is orphaned; the GC chain reclaims it.
+            assert!(rr.is_ok(), "d removed, so rmdir must have succeeded");
+            HyperDir::fs_gc(client, layout, bucket, &ROOT_DIR_UUID).await?;        // reclaim d's prefix
+            HyperDir::fs_gc_orphans(client, layout, bucket, Duration::from_millis(0)).await?; // reclaim the child
+            assert_eq!(maybe_nlink(client, layout, bucket, &child).await, None, "orphaned child reclaimed, no leak");
+        }
+    }
+    Ok(())
+}
