@@ -554,3 +554,121 @@ async fn run_reclaim_intent_recovery(client: &Client, bucket: &str, layout: &Hyp
     assert_eq!(HyperDir::fs_recover_renames(client, layout, bucket).await?, 0, "no intents left on second recovery");
     Ok(())
 }
+
+
+/// A: crash in the second phase of a delete -- the name was folded out and the
+/// tombstone written, but nlink was not decremented (stale-high). fs_gc sees
+/// the tombstone with nlink > 0 and refuses to reclaim; fs_gc_orphans, which is
+/// reachability-based and ignores nlink, must reclaim the now-nameless file.
+#[tokio::test]
+#[ignore]
+async fn e2e_unlink_crash_after_tombstone() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let result = run_unlink_crash_after_tombstone(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    result.expect("unlink phase-2 crash flow");
+}
+
+async fn run_unlink_crash_after_tombstone(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    let _root = HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    let f = create_file(client, layout, bucket, &ROOT_DIR_UUID, "x").await?;
+    { let mut r = HyperDir::fs_open_root(client, layout, bucket, FileFlags::rdwr()).await?; r.fs_compact().await?; }
+
+    // crash injection: name folded out + tombstone written, nlink NOT decremented
+    HyperDir::fs_unlink_crash_after_tombstone(client, layout, bucket, &ROOT_DIR_UUID, "x", &f).await?;
+    assert_eq!(file_nlink(client, layout, bucket, &f).await?, 1, "nlink left stale-high (>0)");
+
+    // fs_gc cannot reclaim it: the tombstone's child still has nlink > 0.
+    let _ = HyperDir::fs_gc(client, layout, bucket, &ROOT_DIR_UUID).await?;
+    assert!(file_exists(client, layout, bucket, &f).await, "fs_gc must not reclaim a stale-high-nlink child");
+
+    // fs_gc_orphans (reachability, ignores nlink) reclaims the nameless file.
+    let n = HyperDir::fs_gc_orphans(client, layout, bucket, Duration::from_millis(0)).await?;
+    assert!(n >= 1, "orphan sweep reclaimed the file, got {}", n);
+    assert!(!file_exists(client, layout, bucket, &f).await, "nameless stale-nlink file reclaimed by orphan GC");
+    Ok(())
+}
+
+/// B: crash in fs_link after the nlink bump but before the entry insert -- an
+/// over-count. The file keeps its existing name; once that name is unlinked it
+/// is nameless with nlink still 1 (should be 0), so fs_gc won't reclaim it and
+/// fs_gc_orphans must.
+#[tokio::test]
+#[ignore]
+async fn e2e_link_crash_overcount() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let result = run_link_crash_overcount(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    result.expect("link crash over-count flow");
+}
+
+async fn run_link_crash_overcount(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    let _root = HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    let f = create_file(client, layout, bucket, &ROOT_DIR_UUID, "x").await?;
+    { let mut r = HyperDir::fs_open_root(client, layout, bucket, FileFlags::rdwr()).await?; r.fs_compact().await?; }
+
+    // crash injection: nlink bumped, second name never inserted.
+    HyperDir::fs_link_bump_only(client, layout, bucket, &f).await?;
+    assert_eq!(file_nlink(client, layout, bucket, &f).await?, 2, "over-counted nlink");
+
+    // unlink the only real name -> nlink folds 2->1, but the file is now nameless.
+    HyperDir::fs_unlink(client, layout, bucket, &ROOT_DIR_UUID, "x", &f, false, None).await?;
+    { let mut r = HyperDir::fs_open_root(client, layout, bucket, FileFlags::rdwr()).await?; r.fs_compact().await?; }
+    assert_eq!(file_nlink(client, layout, bucket, &f).await?, 1, "stale-high nlink survives the unlink");
+
+    // fs_gc can't reclaim (nlink > 0); fs_gc_orphans backstops the leak.
+    let _ = HyperDir::fs_gc(client, layout, bucket, &ROOT_DIR_UUID).await?;
+    assert!(file_exists(client, layout, bucket, &f).await, "fs_gc leaves the over-counted file");
+    let n = HyperDir::fs_gc_orphans(client, layout, bucket, Duration::from_millis(0)).await?;
+    assert!(n >= 1, "orphan sweep reclaimed the leak, got {}", n);
+    assert!(!file_exists(client, layout, bucket, &f).await, "link-crash over-count reclaimed by orphan GC");
+    Ok(())
+}
+
+/// C: a crashed mkdir (directory inode written, name never scattered) leaves a
+/// nameless directory that fs_gc never sees (no tombstone). fs_gc_orphans must
+/// reclaim an empty, unreferenced directory -- without it the dir leaks forever.
+#[tokio::test]
+#[ignore]
+async fn e2e_orphan_dir_gc() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let result = run_orphan_dir_gc(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    result.expect("orphan dir gc flow");
+}
+
+async fn run_orphan_dir_gc(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    let _root = HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+
+    // A real directory still referenced by root must NOT be collected.
+    let (_kept, ukept) = HyperDir::fs_create_default(client, layout, bucket, &ROOT_DIR_UUID, "kept", FileFlags::rdwr(), dir_mode()).await?;
+    { let mut r = HyperDir::fs_open_root(client, layout, bucket, FileFlags::rdwr()).await?; r.fs_compact().await?; }
+
+    // Crashed mkdir: create the directory inode WITHOUT scattering a name into
+    // any parent (fs_create makes the DIR/<uuid> directly, no interceptor).
+    let orphan = Uuid::new_v4();
+    {
+        let mut d = HyperDir::fs_create(client, &layout.dir_uri(bucket, &orphan), FileFlags::rdwr(), dir_mode()).await?;
+        d.fs_flush().await?;
+    }
+    assert!(dir_exists(client, layout, bucket, &orphan).await, "orphan dir created");
+
+    let n = HyperDir::fs_gc_orphans(client, layout, bucket, Duration::from_millis(0)).await?;
+    assert!(n >= 1, "orphan sweep reclaimed the nameless dir, got {}", n);
+    assert!(!dir_exists(client, layout, bucket, &orphan).await, "nameless empty dir reclaimed");
+    assert!(dir_exists(client, layout, bucket, &ukept).await, "referenced dir left intact");
+    Ok(())
+}
+
+async fn dir_exists(client: &Client, layout: &HyperDirLayout, bucket: &str, uuid: &Uuid) -> bool {
+    HyperDir::fs_getattr_fast(client, &layout.dir_uri(bucket, uuid)).await.is_ok()
+}
