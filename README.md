@@ -49,7 +49,8 @@ protocol lives in `hyperfs`.
 s3://<bucket>/[<base>/]DIR/<uuid>/      a directory
 s3://<bucket>/[<base>/]FILE/<uuid>/     a file
 s3://<bucket>/[<base>/]DIR/<nil-uuid>/  the root directory
-s3://<bucket>/[<base>/]_TXN/<ulid>.intent   cross-directory rename intent
+s3://<bucket>/[<base>/]_TXN/<src_parent>_<b64(src_name)>.intent   cross-directory rename intent (source-scoped)
+s3://<bucket>/[<base>/]_TXN/<ulid>.reclaim                        displaced-child reclaim intent
 ```
 
 ## Requirements
