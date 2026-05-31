@@ -333,6 +333,10 @@ or an exclusive claim, makes them safe — never atomic across objects):
 **Eventual** (converges within a maintenance-loop interval):
 
 - **nlink** reflects an unlink only after the parent is compacted (§8).
+- **A directory's `mtime`/`ctime`** do not advance per child create/unlink/
+  rename: a child mutation writes a scatter and never touches the parent inode
+  (the point of the scatter model), so parent-directory timestamps are eventual
+  (updated only when the parent is next flushed) — the same tradeoff as `nlink`.
 - **Storage reclaim** lags the namespace: a name disappears at once, but the
   child prefix is reclaimed by `fs_gc` after retention, and nameless orphans by
   `fs_gc_orphans` after a grace window (§8).

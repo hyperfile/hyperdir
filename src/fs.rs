@@ -1482,11 +1482,17 @@ async fn adjust_nlink(client: &Client, child_uri: &str, delta: i64) -> Result<u6
         StagingConfig::new_s3_uri(child_uri, None),
         HyperFileRuntimeConfig::default(),
     ).await?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     for _ in 0..NLINK_RETRIES {
         let mut raw: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         let od_state = staging.load_inode(raw.as_mut_u8_slice()).await?;
         let new_nlink = (raw.i_nlink as i64 + delta).max(0) as u64;
         raw.i_nlink = new_nlink;
+        // POSIX: changing the link count updates ctime. (For a hard link this is
+        // eager; for an unlink the decrement -- and so this bump -- happens when
+        // compaction folds the delete, so the file's ctime is eventual there.)
+        raw.i_ctime = now.as_secs();
+        raw.i_ctime_nsec = now.subsec_nanos();
         match staging.flush_inode(raw.as_u8_slice(), &od_state, FlushInodeFlag::Update).await {
             Ok(_) => return Ok(new_nlink),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
