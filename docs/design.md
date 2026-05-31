@@ -86,7 +86,7 @@ Scatter objects live under the parent directory's `!/`, with the **file name
 as its own path segment** (name-first), typed by suffix:
 
 ```
-<parent>/!/{base64(name)}/{ulid}_{uuid}_{op}.inode       Create / Update
+<parent>/!/{base64(name)}/{ulid}_{uuid}_{op}.inode       Create / Update / PreDelete
 <parent>/!/{base64(name)}/{ulid}_{uuid}_{op}.tombstone   Delete
 ```
 
@@ -95,8 +95,10 @@ listed directly with `LIST prefix=<parent>/!/{base64(name)}/` (the cheap
 single-name resolve, §6) without scanning the whole directory. The `ulid`
 orders a name's events; `base64` uses an alphabet without `_`/`/` and the uuid
 is hyphenated, so `_` stays an unambiguous field separator. `op` is
-`DirScatterInodeOp` (`Create`, `Update`, `Delete`, `PreDelete` *(planned)*,
-`Unknown`).
+`DirScatterInodeOp` (`Create`, `Update`, `PreDelete`, `Delete`, `Unknown`);
+only `Delete` uses the `.tombstone` suffix. `PreDelete` is phase 1 of the
+two-phase delete (§8): a cheap unlink marker whose body is just `is_dir` + the
+retention deadline; compaction turns it into a real `Delete` tombstone.
 
 ## 5. Write path: scatter as the commit point
 
@@ -144,9 +146,9 @@ advisory.
 path), that is too expensive. `resolve_entry(name)` is the cheap path:
 
 1. LIST only that name's scatter folder `!/{base64(name)}/` (0..N objects).
-2. If any exist, the latest wins — Create/Update ⇒ present (with its inode),
-   Delete ⇒ absent. (If the winning Create body was concurrently compacted away,
-   fall back to the B-tree point lookup.)
+2. If any exist, the latest wins — Create/Update ⇒ present (with its inode), a
+   Delete or PreDelete (phase-1 unlink, §8) ⇒ absent. (If the winning Create
+   body was concurrently compacted away, fall back to the B-tree point lookup.)
 3. Only when the name has no pending scatter, do a single B-tree point lookup.
 
 It never concludes from a B-tree hit alone (a newer Delete tombstone would be
@@ -168,9 +170,10 @@ concurrent compactor just folded is never missed.
   `AlreadyExists`).
 - `compact` reloads the handle to the latest committed inode/bmap before
   folding (so it never folds onto a stale snapshot), applies the scatter, and
-  flushes. When it folds a `Delete` that actually removed an entry, it
-  decrements that child's `nlink` (see §8) — this is the single lease-serialized
-  point that makes the count exactly-once.
+  flushes. When it folds a `PreDelete` that actually removed an entry it runs
+  **phase 2** of the delete (§8): read the child's inode, write the real
+  `Delete` tombstone, and decrement a file's `nlink` — this is the single
+  lease-serialized point that makes the count exactly-once.
 - `read_dir` likewise walks the latest bmap (re-read), merged with a fresh
   scatter LIST, so it neither misses a just-folded entry nor double-counts one.
 - A background **maintenance loop** (in `hyperfs`) drives `fs_recover_renames`,
@@ -178,22 +181,27 @@ concurrent compactor just folded is never missed.
 
 ## 8. Deletion, retention, and GC
 
-Deletion is tombstone-based: it does not physically delete the child prefix.
+Deletion is **two-phase** and tombstone-based: it does not physically delete
+the child prefix.
 
 - **Tombstone body** = `TombstoneHeader { deleted_at_unix_ms,
   retention_until_unix_ms }` (16 bytes) followed by the child's full `InodeRaw`
   (preserved to enable a future undelete).
-- `fs_unlink(.., child_is_dir, retention)`: read the child inode, build the
-  tombstone, emit a `Delete` scatter (commit). It does **not** touch `nlink` and
-  does **not** delete the prefix.
-- `compact` applies the B-tree removal but **keeps** the tombstone object for
-  GC. When it folds a `Delete` that actually removed an entry, it decrements
-  that file's authoritative `nlink` once. Because compaction holds the
-  per-directory lease and a re-seen (kept) tombstone yields `probe_delete ==
-  false`, the decrement is **exactly-once** even under concurrent/duplicate
-  unlinks of the same name (which would otherwise over-decrement and prematurely
-  reclaim a still-linked file). The trade-off is that `nlink` lags until the
-  next compaction (eventual), consistent with the deferred deletion model.
+- **Phase 1** — `fs_unlink(.., child_is_dir, retention)`: emit a cheap
+  `PreDelete` scatter whose body is just `is_dir` + the retention deadline
+  computed now. It does **not** read the child inode, build a tombstone, touch
+  `nlink`, or delete the prefix. `read_dir`/`resolve` treat the name as gone
+  immediately.
+- **Phase 2** — `compact` folds the `PreDelete` out of the bmap and then, at
+  that single lease-serialized point, reads the child's authoritative inode,
+  writes the real `Delete` tombstone (stamped with the recorded retention), and
+  decrements a file's `nlink` once. Folding the name and deciding the decrement
+  happen under the lease, so duplicate/concurrent unlinks of one name
+  decrement **exactly once** (never over-decrementing, which would prematurely
+  reclaim a still-linked file). A later `compact` re-sees the kept tombstone but
+  `probe_delete` returns `false`, so it is not double-counted. The trade-off is
+  that `nlink` lags until compaction (eventual), consistent with the deferred
+  deletion model.
 - `fs_gc(.., parent_uuid)`: for each expired tombstone (retention passed),
   reclaim a directory unconditionally, but reclaim a file only when its
   authoritative `nlink` has reached zero (otherwise just remove the tombstone —
@@ -275,8 +283,8 @@ when the prefix is deleted (unlink / GC need no change).
   nlink bump and the entry commit, or a create+unlink before any compact); this
   is a storage leak, never data loss, reclaimed by `fs_gc_orphans`.
 - Cached `nlink` in a listing can lag for hard-linked files (advisory).
-- `PreDelete` (two-phase delete) and `undelete` are unimplemented (the
-  tombstone already preserves the full inode to enable undelete later).
+- `undelete` is unimplemented (the tombstone already preserves the full inode
+  to enable it later).
 - Advisory locks have no blocking acquisition (non-blocking only), cost an S3
   round-trip per op, and rely on TTL renewal to free a crashed holder's locks.
 - `inode_mut` relies on a `&self -> &mut Inode` transmute inherited from the
@@ -319,4 +327,17 @@ properties (every interleaving must satisfy them, not a specific winner):
   exactly one entry;
 - concurrent same-source rename — the source ends up under exactly one name;
 - concurrent duplicate unlink of one name on a 2-link file — `nlink` drops by
-  exactly one (not two), so the surviving link is never orphaned.
+  exactly one (not two), so the surviving link is never orphaned;
+- a foreground op racing an in-progress `compact` of the same dir — an unlink's
+  delete and a create's entry are each folded exactly once;
+- `fs_gc_orphans` racing an in-flight create — the grace window keeps the
+  brand-new file from being reclaimed;
+- mixed hard link (eager `nlink` bump) + unlink (compaction-deferred decrement)
+  on one target — the net `nlink` is exact;
+- concurrent `fs_recover_renames` of one committed cross-dir intent, and
+  concurrent identical `fs_rename_across` — both converge idempotently;
+- concurrent `fs_reclaim` — a file with `nlink>1` is refused, an orphan is
+  reclaimed exactly once;
+- create vs unlink of one name — at most one entry, never a dangling resolve;
+- concurrent xattr (same-name last-write-wins, distinct names independent) and
+  contended overlapping write locks (S3 OCC grants exactly one owner).
