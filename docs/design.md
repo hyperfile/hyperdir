@@ -333,10 +333,21 @@ or an exclusive claim, makes them safe — never atomic across objects):
 **Eventual** (converges within a maintenance-loop interval):
 
 - **nlink** reflects an unlink only after the parent is compacted (§8).
-- **A directory's `mtime`/`ctime`** do not advance per child create/unlink/
+- **A directory's `mtime`/`ctime`** do not advance on child create/unlink/
   rename: a child mutation writes a scatter and never touches the parent inode
-  (the point of the scatter model), so parent-directory timestamps are eventual
-  (updated only when the parent is next flushed) — the same tradeoff as `nlink`.
+  (the point of the scatter model), and compaction's bmap flush preserves the
+  directory's times — so a parent directory's timestamps reflect only its own
+  create/chmod/chown, not its entries changing. Accepted as best-effort, the
+  same class of tradeoff as `nlink`.
+
+  *A synchronous-accurate version is possible but deliberately not implemented:*
+  each entry change already writes a timestamped scatter into the parent's `!/`,
+  so the read path could report `dir.mtime/ctime = max(inode times, newest
+  pending scatter timestamp)` — accurate the instant the change is made, with no
+  parent-inode write — provided compaction *absorbs* the folded scatters' max
+  timestamp into the inode (taking `max`) before deleting them, so the value
+  never regresses post-fold. It is skipped because it adds a scatter `LIST` to
+  every directory `stat` (a hot path); the eventual model is kept instead.
 - **Storage reclaim** lags the namespace: a name disappears at once, but the
   child prefix is reclaimed by `fs_gc` after retention, and nameless orphans by
   `fs_gc_orphans` after a grace window (§8).
