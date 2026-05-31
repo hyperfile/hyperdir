@@ -21,7 +21,7 @@ base64 = "0.22.1"
 crc64fast = "1.1.0"
 aws-sdk-s3 = "1.85.0"
 btree-ondisk = { version = "0.18.1", default-features = false }
-hyperfile = { version = "0.3.1", default-features = false }
+hyperfile = { version = "0.3.2", default-features = false }
 
 [features]
 default = ["hyperfile/blocking", "hyperfile/meta_loader_batch"]
