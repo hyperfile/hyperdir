@@ -39,7 +39,8 @@ Built by `HyperDirLayout` (`src/layout.rs`):
 s3://<bucket>/[<base>/]DIR/<uuid>/      a directory's Hyperfile
 s3://<bucket>/[<base>/]FILE/<uuid>/     a file's Hyperfile
 s3://<bucket>/[<base>/]DIR/<nil-uuid>/  the root directory (ROOT_DIR_UUID)
-s3://<bucket>/[<base>/]_TXN/<ulid>.intent   cross-directory rename intent
+s3://<bucket>/[<base>/]_TXN/<ulid>.intent    cross-directory rename intent
+s3://<bucket>/[<base>/]_TXN/<ulid>.reclaim   displaced-child reclaim intent (rename replace-over-existing)
 ```
 
 - Identity is a **UUIDv4**; ordering/transaction ids use **ULID**.
@@ -81,17 +82,21 @@ avoid silent overwrites, hyperdir uses linear-probing open addressing:
 
 ## 4. Scatter object naming
 
-Scatter objects live under the parent directory's `!/` and are typed by suffix
-(so they can be filtered by listing):
+Scatter objects live under the parent directory's `!/`, with the **file name
+as its own path segment** (name-first), typed by suffix:
 
 ```
-<parent>/!/{ulid}_{base64(name)}_{uuid}_{op}.inode       Create / Update
-<parent>/!/{ulid}_{base64(name)}_{uuid}_{op}.tombstone   Delete
+<parent>/!/{base64(name)}/{ulid}_{uuid}_{op}.inode       Create / Update
+<parent>/!/{base64(name)}/{ulid}_{uuid}_{op}.tombstone   Delete
 ```
 
-`base64` uses an alphabet without `_`, and the uuid is hyphenated, so `_` is an
-unambiguous separator. `op` is `DirScatterInodeOp` (`Create`, `Update`,
-`Delete`, `PreDelete` *(planned)*, `Unknown`).
+Putting `base64(name)` in its own path segment lets a single name's scatter be
+listed directly with `LIST prefix=<parent>/!/{base64(name)}/` (the cheap
+single-name resolve, §6) without scanning the whole directory. The `ulid`
+orders a name's events; `base64` uses an alphabet without `_`/`/` and the uuid
+is hyphenated, so `_` stays an unambiguous field separator. `op` is
+`DirScatterInodeOp` (`Create`, `Update`, `Delete`, `PreDelete` *(planned)*,
+`Unknown`).
 
 ## 5. Write path: scatter as the commit point
 
@@ -133,6 +138,24 @@ Consumers that open a file through a directory entry should refresh `nlink`
 cached copy — particularly for hard-linked files, whose cached `nlink` is only
 advisory.
 
+### Cheap single-name resolve
+
+`read_dir` walks the whole directory; for resolving one name (lookup, the hot
+path), that is too expensive. `resolve_entry(name)` is the cheap path:
+
+1. LIST only that name's scatter folder `!/{base64(name)}/` (0..N objects).
+2. If any exist, the latest wins — Create/Update ⇒ present (with its inode),
+   Delete ⇒ absent. (If the winning Create body was concurrently compacted away,
+   fall back to the B-tree point lookup.)
+3. Only when the name has no pending scatter, do a single B-tree point lookup.
+
+It never concludes from a B-tree hit alone (a newer Delete tombstone would be
+missed) yet avoids the full walk. `HyperDir::fs_resolve_entry_fast` is the
+handle-less variant (builds staging directly), so the per-path-component lookup
+pays no separate open-the-handle inode read. Point lookups read the **latest**
+bmap (re-read from staging), not this handle's open-time snapshot, so a name a
+concurrent compactor just folded is never missed.
+
 ## 7. Compaction and concurrency
 
 - `read_dir` is the read path; `compact` is the write path (apply scatter to the
@@ -143,8 +166,15 @@ advisory.
   avoids duplicated work; **correctness** still comes from hyperfile's per-inode
   OCC (two compactors that both flush the parent inode produce one `Ok` and one
   `AlreadyExists`).
-- Scheduling of `compact` / `fs_gc` / `fs_recover_renames` is the caller's job
-  *(planned: a background maintenance loop)*.
+- `compact` reloads the handle to the latest committed inode/bmap before
+  folding (so it never folds onto a stale snapshot), applies the scatter, and
+  flushes. When it folds a `Delete` that actually removed an entry, it
+  decrements that child's `nlink` (see §8) — this is the single lease-serialized
+  point that makes the count exactly-once.
+- `read_dir` likewise walks the latest bmap (re-read), merged with a fresh
+  scatter LIST, so it neither misses a just-folded entry nor double-counts one.
+- A background **maintenance loop** (in `hyperfs`) drives `fs_recover_renames`,
+  then per-directory `fs_compact` + `fs_gc`, then `fs_gc_orphans`, each pass.
 
 ## 8. Deletion, retention, and GC
 
@@ -154,15 +184,25 @@ Deletion is tombstone-based: it does not physically delete the child prefix.
   retention_until_unix_ms }` (16 bytes) followed by the child's full `InodeRaw`
   (preserved to enable a future undelete).
 - `fs_unlink(.., child_is_dir, retention)`: read the child inode, build the
-  tombstone, emit a `Delete` scatter (commit). For files only, then decrement
-  the authoritative `nlink` (after the tombstone, so a crash over-counts — a
-  leak — rather than under-counts, which would lose data). It does not delete
-  the prefix.
-- `compact` applies the B-tree removal but **keeps** the tombstone object for GC.
+  tombstone, emit a `Delete` scatter (commit). It does **not** touch `nlink` and
+  does **not** delete the prefix.
+- `compact` applies the B-tree removal but **keeps** the tombstone object for
+  GC. When it folds a `Delete` that actually removed an entry, it decrements
+  that file's authoritative `nlink` once. Because compaction holds the
+  per-directory lease and a re-seen (kept) tombstone yields `probe_delete ==
+  false`, the decrement is **exactly-once** even under concurrent/duplicate
+  unlinks of the same name (which would otherwise over-decrement and prematurely
+  reclaim a still-linked file). The trade-off is that `nlink` lags until the
+  next compaction (eventual), consistent with the deferred deletion model.
 - `fs_gc(.., parent_uuid)`: for each expired tombstone (retention passed),
   reclaim a directory unconditionally, but reclaim a file only when its
   authoritative `nlink` has reached zero (otherwise just remove the tombstone —
   other hard links remain). Then remove the tombstone.
+- `fs_gc_orphans(.., grace)`: a backstop sweep. It marks every file UUID
+  referenced by any directory's `read_dir` (scatter-aware), then reclaims any
+  `FILE/<uuid>` not referenced whose inode is older than `grace` — catching
+  nameless files no tombstone covers (e.g. a create+unlink before any compact,
+  or a hard-linked child displaced by a replace-over-existing rename).
 - `fs_rmdir`: verify the child directory is empty via `read_dir`
   (`DirectoryNotEmpty` otherwise), then `fs_unlink` it.
 - `nlink` is authoritative in the child inode; `adjust_nlink` uses a
@@ -177,16 +217,29 @@ Deletion is tombstone-based: it does not physically delete the child prefix.
   `fs_open_root` handle the parentless root; `fs_open_dir` opens by UUID.
 - **Same-directory rename** (`fs_rename`): rebuild the entry with the same
   inode+uuid under the new name, `probe_delete(old)` + `probe_upsert(new)`, one
-  flush — atomic via OCC, no scatter, no data move. Errors `AlreadyExists` if
-  the destination exists (replace-over-existing is left to the caller).
+  flush — atomic via OCC, no scatter, no data move.
 - **Cross-directory rename** (`fs_rename_across`): write a `_TXN/<ulid>.intent`
   object (`If-None-Match: *`) as the single commit point, then apply it
   (destination-add before source-remove, so the child is always reachable),
   then delete the intent. A crash leaves the intent for `fs_recover_renames`,
   which replays it idempotently.
+- **Replace-over-existing rename**: the destination-add is an upsert, so an
+  existing destination's slot is replaced in place. Before overwriting, the
+  caller records a `_TXN/<ulid>.reclaim` intent (`fs_emit_reclaim_intent`)
+  naming the displaced child; after the rename it reclaims that child
+  (`fs_reclaim`, idempotent: a file only when its `nlink<=1`). A crash in
+  between leaves the `.reclaim` intent, which `fs_recover_renames` completes —
+  but only once the displaced name no longer resolves to it (it rechecks, to
+  avoid racing an in-flight rename); a clearly-stale intent is just dropped.
 - **Hard link** (`fs_link`): reject directory targets; bump the file's
-  authoritative `nlink` (no scatter, OCC), then insert a directory entry
-  pointing at the same UUID.
+  authoritative `nlink`, then insert the entry under the new name. The parent is
+  opened **FailFast** and the insert is **exclusive** (`insert_entry_excl`
+  refuses to overwrite an existing name), so a concurrent same-name link cannot
+  silently clobber the winner. Any path that fails to commit the entry (the name
+  was taken, a lost OCC race after retries, or a transient error) rolls the
+  `nlink` bump back, so a failed/raced link never leaks an over-count. The only
+  residual is a true process crash between the bump and the entry commit,
+  backstopped by `fs_gc_orphans`.
 
 ## 10. Advisory locks (`lock` module)
 
@@ -213,8 +266,14 @@ when the prefix is deleted (unlink / GC need no change).
 
 ## 11. Known limitations (PoC)
 
-- TOCTOU windows in cross-directory rename / link (destination pre-check vs
-  commit) and crash-window `nlink` over-count (a storage leak, never data loss).
+- Cross-directory rename / link still have a pre-check-vs-commit TOCTOU window,
+  but it cannot lose data: the rename is intent-recovered and `fs_link`'s
+  exclusive insert + nlink rollback make a raced link fail cleanly rather than
+  clobber/leak.
+- `nlink` is eventual: it reflects an unlink only after the parent is compacted.
+- True process crashes can leave a nameless file (an `fs_link` crash between the
+  nlink bump and the entry commit, or a create+unlink before any compact); this
+  is a storage leak, never data loss, reclaimed by `fs_gc_orphans`.
 - Cached `nlink` in a listing can lag for hard-linked files (advisory).
 - `PreDelete` (two-phase delete) and `undelete` are unimplemented (the
   tombstone already preserves the full inode to enable undelete later).
@@ -249,3 +308,15 @@ when the prefix is deleted (unlink / GC need no change).
   the other);
 - cross-directory rename crash recovery (intent committed, not applied;
   `fs_recover_renames` completes it).
+
+`tests/e2e_concurrent.rs` (same prerequisites) drives several operations
+concurrently against one shared namespace and asserts interleaving-invariant
+properties (every interleaving must satisfy them, not a specific winner):
+
+- concurrent same-name hard link to distinct targets — exactly one wins, the
+  winner's `nlink` is 2 and no loser's `nlink` is leaked;
+- concurrent same-name create / same-name mkdir — the merged view converges to
+  exactly one entry;
+- concurrent same-source rename — the source ends up under exactly one name;
+- concurrent duplicate unlink of one name on a 2-link file — `nlink` drops by
+  exactly one (not two), so the surviving link is never orphaned.
