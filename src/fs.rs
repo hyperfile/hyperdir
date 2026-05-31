@@ -962,6 +962,46 @@ impl<'a> HyperDir<'a>
         Ok(())
     }
 
+    /// Test-only: simulate a crash in the *second phase* of a delete -- the
+    /// name has been folded out of the parent's bmap and the `Delete` tombstone
+    /// written, but the child's `nlink` was NOT decremented yet. The child is
+    /// then nameless with a stale-high `nlink`, so `fs_gc` (which only reclaims
+    /// a file once `nlink == 0`) cannot reclaim it; `fs_gc_orphans` must.
+    #[doc(hidden)]
+    pub async fn fs_unlink_crash_after_tombstone(
+        client: &Client, layout: &HyperDirLayout, bucket: &str,
+        parent_dir_uuid: &Uuid, name: &str, child_uuid: &Uuid,
+    ) -> Result<()>
+    {
+        let child_uri = layout.file_uri(bucket, child_uuid);
+        let staging = S3Staging::from(client, StagingConfig::new_s3_uri(&child_uri, None),
+            HyperFileRuntimeConfig::default()).await?;
+        let mut raw: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        staging.load_inode(raw.as_mut_u8_slice()).await?;
+        let body = build_tombstone_body(unix_now_ms(), 0, raw.as_u8_slice());
+        let parent_staging = S3Staging::from(client,
+            StagingConfig::new_s3_uri(&layout.dir_uri(bucket, parent_dir_uuid), None),
+            HyperFileRuntimeConfig::default()).await?;
+        parent_staging.emit_scatter_event(name, child_uuid, &body, DirScatterInodeOp::Delete).await?;
+        let mut parent = Self::fs_open_dir(client, layout, bucket, parent_dir_uuid, FileFlags::rdwr()).await?;
+        let _ = parent.inner.remove_entry(name).await?;
+        Ok(()) // nlink deliberately NOT decremented
+    }
+
+    /// Test-only: simulate a crash in `fs_link` after the `nlink` bump but
+    /// before the directory entry was inserted -- an over-count. The file keeps
+    /// its existing name(s); once the last real name is unlinked it is a
+    /// nameless file with a stale-high `nlink` that only `fs_gc_orphans` can
+    /// reclaim.
+    #[doc(hidden)]
+    pub async fn fs_link_bump_only(
+        client: &Client, layout: &HyperDirLayout, bucket: &str, target_file_uuid: &Uuid,
+    ) -> Result<()>
+    {
+        let _ = adjust_nlink(client, &layout.file_uri(bucket, target_file_uuid), 1).await?;
+        Ok(())
+    }
+
     /// Re-drive any rename intents left behind by an interrupted
     /// [`fs_rename_across`] (e.g. a crash between the commit and the intent
     /// delete). Each intent's forward steps are idempotent, so re-applying a
@@ -1049,8 +1089,11 @@ impl<'a> HyperDir<'a>
     /// by a replace-over-existing rename, left with a stale-high nlink). This
     /// is the backstop: mark every UUID referenced by any directory's
     /// `read_dir` (scatter-aware, so freshly created entries count), then purge
-    /// any `FILE/<uuid>` not in that set whose inode is older than `grace`. The
-    /// grace window avoids collecting a file whose creation is still in flight.
+    /// any `FILE/<uuid>` not in that set whose inode is older than `grace`, and
+    /// any EMPTY `DIR/<uuid>` not in that set (excluding the root) -- catching a
+    /// crashed mkdir's nameless directory too. The grace window avoids
+    /// collecting a child whose creation is still in flight. A non-empty orphan
+    /// directory subtree is left in place (a documented limitation).
     pub async fn fs_gc_orphans(client: &Client, layout: &HyperDirLayout, bucket: &str, grace: Duration) -> Result<usize> {
         use std::collections::HashSet;
         let mut referenced: HashSet<Uuid> = HashSet::new();
@@ -1077,6 +1120,31 @@ impl<'a> HyperDir<'a>
                     }
                 },
                 _ => {}, // young, or already gone
+            }
+        }
+
+        // Orphaned directories: a `DIR/<uuid>` that no parent references (e.g. a
+        // crashed mkdir that wrote the inode before scattering its name) leaks
+        // otherwise -- `fs_gc` only reclaims tombstoned dirs. Reclaim only an
+        // EMPTY, old-enough orphan (an empty dir strands no children); the root
+        // has no parent and is never an orphan. A non-empty orphan subtree is
+        // left in place (reclaiming it safely would need a reachability walk
+        // from the root).
+        for du in Self::fs_list_dir_uuids(client, layout, bucket).await? {
+            if du.is_nil() || referenced.contains(&du) { continue; }
+            let empty = match Self::fs_open_dir(client, layout, bucket, &du, FileFlags::rdonly()).await {
+                Ok(dir) => dir.fs_read_dir().await.map(|e| e.is_empty()).unwrap_or(false),
+                Err(_) => false,
+            };
+            if !empty { continue; }
+            let uri = layout.dir_uri(bucket, &du);
+            match Self::fs_getattr_fast(client, &uri).await {
+                Ok(st) if now_ms - st.st_ctime.saturating_mul(1000) >= grace_ms => {
+                    if reclaim_child_prefix(client, &uri, HyperFileRuntimeConfig::default()).await.is_ok() {
+                        reclaimed += 1;
+                    }
+                },
+                _ => {},
             }
         }
         Ok(reclaimed)

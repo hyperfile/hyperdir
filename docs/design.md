@@ -206,11 +206,14 @@ the child prefix.
   reclaim a directory unconditionally, but reclaim a file only when its
   authoritative `nlink` has reached zero (otherwise just remove the tombstone —
   other hard links remain). Then remove the tombstone.
-- `fs_gc_orphans(.., grace)`: a backstop sweep. It marks every file UUID
-  referenced by any directory's `read_dir` (scatter-aware), then reclaims any
-  `FILE/<uuid>` not referenced whose inode is older than `grace` — catching
-  nameless files no tombstone covers (e.g. a create+unlink before any compact,
-  or a hard-linked child displaced by a replace-over-existing rename).
+- `fs_gc_orphans(.., grace)`: a backstop sweep. It marks every UUID referenced
+  by any directory's `read_dir` (scatter-aware), then reclaims any `FILE/<uuid>`
+  not referenced whose inode is older than `grace`, plus any **empty**
+  `DIR/<uuid>` not referenced (excluding the root) — catching nameless children
+  no tombstone covers (a create+unlink before any compact, a hard-linked child
+  displaced by a replace-over-existing rename, a phase-2-delete crash with a
+  stale-high nlink, or a crashed mkdir's nameless directory). A non-empty orphan
+  directory subtree is left in place (see §12).
 - `fs_rmdir`: verify the child directory is empty via `read_dir`
   (`DirectoryNotEmpty` otherwise), then `fs_unlink` it. The check and the
   tombstone aren't atomic, so the semantics is best-effort: a create into the
@@ -355,9 +358,12 @@ or an exclusive claim, makes them safe — never atomic across objects):
   commit point is a source-scoped exclusive claim), so a raced same-source
   rename never leaves the child under two names.
 - `nlink` is eventual: it reflects an unlink only after the parent is compacted.
-- True process crashes can leave a nameless file (an `fs_link` crash between the
-  nlink bump and the entry commit, or a create+unlink before any compact); this
-  is a storage leak, never data loss, reclaimed by `fs_gc_orphans`.
+- True process crashes can leave a nameless child (an `fs_link` crash between the
+  nlink bump and the entry commit, a create+unlink before any compact, a
+  phase-2-delete crash with a stale-high nlink, or a crashed mkdir); this is a
+  storage leak, never data loss, reclaimed by `fs_gc_orphans` (files, and empty
+  directories). A **non-empty** orphan directory subtree is not reclaimed —
+  collecting it safely would need a reachability walk from the root.
 - Cached `nlink` in a listing can lag for hard-linked files (advisory).
 - `undelete` is unimplemented (the tombstone already preserves the full inode
   to enable it later).
@@ -398,6 +404,12 @@ or an exclusive claim, makes them safe — never atomic across objects):
 - reclaim-intent crash recovery (a replace-over-existing rename recorded the
   displaced child in a `.reclaim` intent then crashed; recovery reclaims the
   orphan, and leaves a still-named child untouched).
+- phase-2-delete crash (tombstone written, nlink not decremented): `fs_gc`
+  refuses the stale-high-nlink child, `fs_gc_orphans` reclaims it;
+- hard-link crash (nlink bumped, entry not inserted): the over-counted file is
+  reclaimed by `fs_gc_orphans` once its real name is gone;
+- orphan-directory GC (a crashed mkdir's nameless empty directory is reclaimed
+  by `fs_gc_orphans`, while a referenced directory is left intact).
 
 `tests/e2e_concurrent.rs` (same prerequisites) drives several operations
 concurrently against one shared namespace and asserts interleaving-invariant
