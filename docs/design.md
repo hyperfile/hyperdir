@@ -39,7 +39,7 @@ Built by `HyperDirLayout` (`src/layout.rs`):
 s3://<bucket>/[<base>/]DIR/<uuid>/      a directory's Hyperfile
 s3://<bucket>/[<base>/]FILE/<uuid>/     a file's Hyperfile
 s3://<bucket>/[<base>/]DIR/<nil-uuid>/  the root directory (ROOT_DIR_UUID)
-s3://<bucket>/[<base>/]_TXN/<ulid>.intent    cross-directory rename intent
+s3://<bucket>/[<base>/]_TXN/<src_parent>_<b64(src_name)>.intent  cross-directory rename intent (source-scoped, exclusive)
 s3://<bucket>/[<base>/]_TXN/<ulid>.reclaim   displaced-child reclaim intent (rename replace-over-existing)
 ```
 
@@ -226,11 +226,19 @@ the child prefix.
 - **Same-directory rename** (`fs_rename`): rebuild the entry with the same
   inode+uuid under the new name, `probe_delete(old)` + `probe_upsert(new)`, one
   flush — atomic via OCC, no scatter, no data move.
-- **Cross-directory rename** (`fs_rename_across`): write a `_TXN/<ulid>.intent`
-  object (`If-None-Match: *`) as the single commit point, then apply it
-  (destination-add before source-remove, so the child is always reachable),
-  then delete the intent. A crash leaves the intent for `fs_recover_renames`,
-  which replays it idempotently.
+- **Cross-directory rename** (`fs_rename_across`): write a `_TXN` intent object
+  as the single commit point, then apply it (destination-add before
+  source-remove, so the child is always reachable), then delete the intent. A
+  crash leaves the intent for `fs_recover_renames`, which replays it
+  idempotently. The intent key is **source-scoped** (`<src_parent>_<b64(src_name)>`)
+  and written with `If-None-Match: *`, so concurrent renames of the *same*
+  source admit exactly one winner — giving cross-directory rename the same
+  **move-once** guarantee same-directory rename gets from a single OCC flush.
+  After winning the claim the winner re-verifies the source still resolves to
+  the same child (a holder removes the source before releasing its claim, so a
+  loser that then wins the freed claim sees the source already gone and reports
+  `NotFound`); this closes the read-vs-claim TOCTOU that would otherwise leave
+  the child under two names.
 - **Replace-over-existing rename**: the destination-add is an upsert, so an
   existing destination's slot is replaced in place. Before overwriting, the
   caller records a `_TXN/<ulid>.reclaim` intent (`fs_emit_reclaim_intent`)
@@ -274,10 +282,11 @@ when the prefix is deleted (unlink / GC need no change).
 
 ## 11. Known limitations (PoC)
 
-- Cross-directory rename / link still have a pre-check-vs-commit TOCTOU window,
-  but it cannot lose data: the rename is intent-recovered and `fs_link`'s
-  exclusive insert + nlink rollback make a raced link fail cleanly rather than
-  clobber/leak.
+- Hard link still has a pre-check-vs-commit TOCTOU window, but it cannot lose
+  data: `fs_link`'s exclusive insert + nlink rollback make a raced link fail
+  cleanly rather than clobber/leak. Cross-directory rename is move-once (its
+  commit point is a source-scoped exclusive claim), so a raced same-source
+  rename never leaves the child under two names.
 - `nlink` is eventual: it reflects an unlink only after the parent is compacted.
 - True process crashes can leave a nameless file (an `fs_link` crash between the
   nlink bump and the entry commit, or a create+unlink before any compact); this
@@ -335,7 +344,9 @@ properties (every interleaving must satisfy them, not a specific winner):
 - mixed hard link (eager `nlink` bump) + unlink (compaction-deferred decrement)
   on one target — the net `nlink` is exact;
 - concurrent `fs_recover_renames` of one committed cross-dir intent, and
-  concurrent identical `fs_rename_across` — both converge idempotently;
+  concurrent `fs_rename_across` — both converge idempotently; and two
+  concurrent same-source renames to *distinct* destinations land the source
+  under exactly one name (move-once);
 - concurrent `fs_reclaim` — a file with `nlink>1` is refused, an orphan is
   reclaimed exactly once;
 - create vs unlink of one name — at most one entry, never a dangling resolve;
