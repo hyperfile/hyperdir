@@ -91,6 +91,30 @@ impl TombstoneHeader {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 }
 
+/// Build the body of a PreDelete scatter (phase 1 of the two-phase delete): a
+/// 1-byte is-dir flag plus the retention deadline computed at unlink. The
+/// expensive work (reading the child inode, writing the full tombstone,
+/// decrementing nlink) is deferred to compaction, the single lease-serialized
+/// fold point.
+pub(crate) fn build_predelete_body(is_dir: bool, retention_until_unix_ms: i64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(9);
+    body.push(is_dir as u8);
+    body.extend_from_slice(&retention_until_unix_ms.to_le_bytes());
+    body
+}
+
+/// Parse a PreDelete scatter body into `(is_dir, retention_until_unix_ms)`.
+/// Tolerates a short/empty body (older/empty markers) by defaulting to
+/// `(false, 0)` -- 0 retention meaning "GC may reclaim on the next pass".
+pub(crate) fn parse_predelete_body(buf: &[u8]) -> (bool, i64) {
+    let is_dir = buf.first().is_some_and(|b| *b != 0);
+    let retention = match buf.get(1..9) {
+        Some(b) => i64::from_le_bytes(b.try_into().unwrap()),
+        None => 0,
+    };
+    (is_dir, retention)
+}
+
 /// Build the body of a Delete scatter: `TombstoneHeader` followed by the raw
 /// inode bytes captured from the child file at the moment of unlink.
 pub(crate) fn build_tombstone_body(

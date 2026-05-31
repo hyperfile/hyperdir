@@ -24,7 +24,7 @@ use crate::interceptor::ScatterFirstInterceptor;
 use crate::layout::HyperDirLayout;
 use crate::{
     DirStaging, DirScatterInodeOp,
-    build_tombstone_body, parse_tombstone_body, unix_now_ms,
+    build_tombstone_body, build_predelete_body, parse_tombstone_body, unix_now_ms,
 };
 
 impl<'a> HyperDir<'a>
@@ -233,23 +233,13 @@ impl<'a> HyperDir<'a>
         debug!("fs_unlink - child: {}, parent: {}, name: {}, retention: {:?}",
                child_uri, parent_dir_uri, name, retention);
 
-        // Open the child staging just long enough to read its current inode.
-        // We do not modify the child here; the prefix is left in place to be
-        // reclaimed by `fs_gc` after the retention window.
-        let runtime_config = HyperFileRuntimeConfig::default();
-        let child_staging = S3Staging::from(
-            client,
-            StagingConfig::new_s3_uri(&child_uri, None),
-            runtime_config.clone(),
-        ).await?;
-
-        let mut raw_inode: InodeRaw = unsafe {
-            std::mem::MaybeUninit::zeroed().assume_init()
-        };
-        let _ = child_staging.load_inode(raw_inode.as_mut_u8_slice()).await?;
-
-        // Compute retention deadline. 0 means "no retention" -> GC may run
-        // immediately on the next pass.
+        // Two-phase delete, phase 1: emit a cheap PreDelete marker into the
+        // parent's scatter namespace -- no child inode read, no full tombstone.
+        // read_dir/resolve treat a PreDelete as absent immediately. Compaction
+        // (the single lease-serialized fold point, phase 2 in fs_compact) reads
+        // the child's authoritative inode, writes the real Delete tombstone with
+        // this retention deadline, and decrements nlink exactly once. The body
+        // carries is_dir + the retention deadline computed now.
         let now_ms = unix_now_ms();
         let retention_until_unix_ms = match retention {
             None => 0,
@@ -258,25 +248,15 @@ impl<'a> HyperDir<'a>
                 now_ms.saturating_add(dms)
             },
         };
+        let body = build_predelete_body(child_is_dir, retention_until_unix_ms);
 
-        // Body = TombstoneHeader || raw inode bytes.
-        let body = build_tombstone_body(now_ms, retention_until_unix_ms, raw_inode.as_u8_slice());
-
-        // Commit the tombstone into the parent directory's scatter namespace.
+        let runtime_config = HyperFileRuntimeConfig::default();
         let parent_staging = S3Staging::from(
             client,
             StagingConfig::new_s3_uri(&parent_dir_uri, None),
             runtime_config,
         ).await?;
-        parent_staging.emit_scatter_event(name, child_uuid, &body, DirScatterInodeOp::Delete).await?;
-
-        // nlink is NOT decremented here. The decrement happens when compaction
-        // folds this Delete out of the bmap (see HyperDir::fs_compact): that is
-        // the single lease-serialized removal point, so duplicate/concurrent
-        // unlinks of the same name cannot over-decrement (which would reclaim a
-        // file still referenced by another link). Directories carry one name
-        // and are reclaimed by fs_gc unconditionally.
-        let _ = child_is_dir;
+        parent_staging.emit_scatter_event(name, child_uuid, &body, DirScatterInodeOp::PreDelete).await?;
         Ok(())
     }
 
@@ -808,24 +788,69 @@ impl<'a> HyperDir<'a>
     {
         debug!("fs_compact - ");
         let stats = self.inner.compact().await?;
-        // Decrement each folded-delete child's nlink here: compaction holds the
-        // per-directory lease, so this is the single serialized point where a
-        // name is actually removed -- decrementing here (not eagerly in
-        // fs_unlink) makes nlink exactly-once even under concurrent/duplicate
-        // unlinks. A directory child has no FILE inode (NotFound) and is
-        // skipped. nlink lags until compaction, which is consistent with the
+        // Phase 2 of the two-phase delete plus the legacy raw-Delete path.
+        // Compaction holds the per-directory lease, so probe_delete under it
+        // decides -- exactly once, even under concurrent/duplicate unlinks --
+        // which names actually transitioned present->absent this pass; the
+        // post-lease work below (nlink decrement, tombstone write) is driven by
+        // that decision. nlink lags until compaction, consistent with the
         // deferred (tombstone) deletion model.
-        if !stats.removed_children.is_empty() {
+        if !stats.removed_children.is_empty() || !stats.predeleted.is_empty() {
             let client = self.inner.staging().client.clone();
             let bucket = self.inner.staging().bucket.clone();
             let rp = self.inner.staging().root_path.clone();
             let base = &rp[..rp.rfind("DIR/").unwrap_or(0)]; // "{base}DIR/{uuid}" -> "{base}"
+
+            // Legacy path: a raw Delete tombstone folded out of the bmap (rare;
+            // normal unlinks go through the PreDelete path below). Just
+            // decrement nlink once. A directory child has no FILE inode
+            // (NotFound) and is skipped.
             for uuid in &stats.removed_children {
                 let child_uri = format!("s3://{}/{}FILE/{}", bucket, base, uuid);
                 match adjust_nlink(&client, &child_uri, -1).await {
                     Ok(_) => {},
-                    Err(e) if e.kind() == ErrorKind::NotFound => {}, // directory child / already gone
+                    Err(e) if e.kind() == ErrorKind::NotFound => {},
                     Err(e) => warn!("fs_compact: nlink decrement failed for {}: {}", child_uri, e),
+                }
+            }
+
+            // Two-phase delete, phase 2: for each folded PreDelete, read the
+            // child's authoritative inode now, write the real Delete tombstone
+            // (with the retention deadline the unlink recorded) into this
+            // directory's scatter, then decrement a file's nlink once. A later
+            // compact folds that tombstone (probe_delete already false -> no
+            // double dec); fs_gc reclaims the prefix once nlink hits 0 and
+            // retention passes. A crash mid-step at worst leaves a nameless
+            // file that the orphan GC reclaims.
+            for (name, uuid, is_dir, retention_until) in &stats.predeleted {
+                let child_uri = if *is_dir {
+                    format!("s3://{}/{}DIR/{}", bucket, base, uuid)
+                } else {
+                    format!("s3://{}/{}FILE/{}", bucket, base, uuid)
+                };
+                let staging = match S3Staging::from(
+                    &client, StagingConfig::new_s3_uri(&child_uri, None), HyperFileRuntimeConfig::default()).await {
+                    Ok(s) => s,
+                    Err(e) if e.kind() == ErrorKind::NotFound => continue, // child already gone
+                    Err(e) => { warn!("fs_compact: open child {} failed: {}", child_uri, e); continue; },
+                };
+                let mut raw: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+                if let Err(e) = staging.load_inode(raw.as_mut_u8_slice()).await {
+                    warn!("fs_compact: load child inode {} failed: {}", child_uri, e);
+                    continue;
+                }
+                let body = build_tombstone_body(unix_now_ms(), *retention_until, raw.as_u8_slice());
+                if let Err(e) = self.inner.staging()
+                    .emit_scatter_event(name, uuid, &body, DirScatterInodeOp::Delete).await {
+                    warn!("fs_compact: write tombstone for {} failed: {}", child_uri, e);
+                    continue; // don't decrement without a tombstone to drive GC
+                }
+                if !*is_dir {
+                    match adjust_nlink(&client, &child_uri, -1).await {
+                        Ok(_) => {},
+                        Err(e) if e.kind() == ErrorKind::NotFound => {},
+                        Err(e) => warn!("fs_compact: nlink decrement failed for {}: {}", child_uri, e),
+                    }
                 }
             }
         }
