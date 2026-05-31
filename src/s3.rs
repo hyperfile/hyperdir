@@ -161,9 +161,11 @@ impl DirStaging for S3Staging {
                 builder.body(body.into())
             },
             DirScatterInodeOp::PreDelete => {
-                // 2-phase delete intent: empty body, op encoded in the key
-                // is enough. Not yet exercised end-to-end.
-                builder
+                // 2-phase delete intent (phase 1): body = is_dir + retention
+                // deadline (see crate::build_predelete_body). The full tombstone
+                // is produced at compaction (phase 2).
+                let body = SdkBody::from(buf);
+                builder.body(body.into())
             },
             DirScatterInodeOp::Unknown => {
                 return Err(Error::new(ErrorKind::InvalidInput,

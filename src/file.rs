@@ -29,6 +29,7 @@ use hyperfile::file::mode::HyperFileMode;
 use hyperfile::ondisk::{BMapRawType, InodeRaw};
 use super::ondisk::{DirFileEntryRaw, DEFAULT_NAME_LEN};
 use super::{DirStaging, DirScatterInode, DirScatterInodeOp};
+use super::parse_predelete_body;
 
 pub const DIR_FILE_ENTRY_RAW_SIZE: usize = std::mem::size_of::<DirFileEntryRaw>();
 
@@ -110,6 +111,13 @@ pub struct CompactStats {
     /// single lease-serialized fold point) makes nlink exactly-once even under
     /// concurrent/duplicate unlinks.
     pub removed_children: Vec<Uuid>,
+    /// PreDelete markers (phase-1 unlink) folded out of the bmap this pass, as
+    /// `(name, child_uuid, is_dir, retention_until_unix_ms)`. For each, the
+    /// caller (`fs_compact`, phase 2) reads the child's authoritative inode,
+    /// writes the real Delete tombstone with that retention, and decrements a
+    /// file's nlink once -- the single lease-serialized point that keeps the
+    /// count exactly-once and the unlink path cheap (no child read at unlink).
+    pub predeleted: Vec<(String, Uuid, bool, i64)>,
 }
 
 /// Internal: the result of listing + classifying + body-fetching scatter
@@ -129,6 +137,11 @@ struct ScatterChanges {
     /// (so compaction can decrement that child's nlink exactly once when it
     /// folds the delete -- the single lease-serialized removal point).
     deletes: HashMap<String, Uuid>,
+    /// Filenames whose latest scatter is PreDelete (phase-1 unlink), mapped to
+    /// `(child_uuid, is_dir, retention_until_unix_ms)`. read_dir treats these
+    /// as absent; compaction folds them out of the bmap and surfaces them to
+    /// `fs_compact` (phase 2) to write the real tombstone + decrement nlink.
+    predeletes: HashMap<String, (Uuid, bool, i64)>,
     /// Subset of `all_keys`: the latest Delete scatter per filename. These
     /// must NOT be deleted by `compact`; they remain in S3 as tombstones
     /// until `fs_gc` reclaims them after their retention expires.
@@ -390,7 +403,9 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
                         // in the B-tree, so fall through to the point lookup.
                     },
                     DirScatterInodeOp::Delete => return Ok(None),
-                    // PreDelete/Unknown: fall through to the B-tree.
+                    // PreDelete (phase-1 unlink): the name is gone.
+                    DirScatterInodeOp::PreDelete => return Ok(None),
+                    // Unknown: fall through to the B-tree.
                     _ => {},
                 }
             }
@@ -487,6 +502,11 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         for name in changes.deletes.keys() {
             view.remove(name);
         }
+        // PreDelete (phase-1 unlink) makes a name disappear immediately, before
+        // compaction writes the real tombstone.
+        for name in changes.predeletes.keys() {
+            view.remove(name);
+        }
 
         Ok(view
             .into_values()
@@ -561,6 +581,19 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             // returns false; idempotent.
         }
 
+        // Phase-1 PreDelete markers: fold the name out of the bmap and surface
+        // (name, uuid, is_dir, retention) to fs_compact (phase 2), which reads
+        // the child inode, writes the real Delete tombstone, and decrements
+        // nlink. The PreDelete object itself is not a tombstone, so it is
+        // stripped below with the other consolidated scatters.
+        let mut predeleted: Vec<(String, Uuid, bool, i64)> = Vec::new();
+        for (name, (child_uuid, is_dir, retention)) in &changes.predeletes {
+            if self.probe_delete(name.as_bytes()).await? {
+                entries_removed += 1;
+                predeleted.push((name.clone(), *child_uuid, *is_dir, *retention));
+            }
+        }
+
         // hyperfile's flush handles OCC retry per FlushConflictPolicy.
         self.flush().await?;
 
@@ -583,6 +616,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             tombstones_kept,
             no_op: false,
             removed_children,
+            predeleted,
         })
     }
 
@@ -597,6 +631,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
 
         let mut to_remove = Vec::new();
         let mut to_fetch = Vec::new();
+        let mut to_fetch_pre = Vec::new();
         let mut tombstone_keys: HashSet<String> = HashSet::new();
         for s in last_view {
             match s.op {
@@ -604,7 +639,9 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
                     warn!("scatter inode of unknown op: {}", s.key);
                 },
                 DirScatterInodeOp::PreDelete => {
-                    warn!("scatter inode of PreDelete (not yet implemented): {}", s.key);
+                    // Phase-1 unlink marker; fetch its tiny body for is_dir +
+                    // retention. Not a tombstone, so it is stripped at compact.
+                    to_fetch_pre.push(s);
                 },
                 DirScatterInodeOp::Delete => {
                     // The latest Delete per filename is a tombstone; remember
@@ -635,7 +672,13 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             deletes.insert(s.filename, s.uuid);
         }
 
-        Ok(ScatterChanges { all_keys, upserts, deletes, tombstone_keys })
+        let mut predeletes: HashMap<String, (Uuid, bool, i64)> = HashMap::new();
+        for (s, body) in self.staging.collect_scatter_inodes(to_fetch_pre).await? {
+            let (is_dir, retention) = parse_predelete_body(&body);
+            predeletes.insert(s.filename, (s.uuid, is_dir, retention));
+        }
+
+        Ok(ScatterChanges { all_keys, upserts, deletes, predeletes, tombstone_keys })
     }
 
     /// Walk the persisted bmap read-only, returning all valid entries.
