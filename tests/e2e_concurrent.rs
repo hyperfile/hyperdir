@@ -159,3 +159,108 @@ async fn run_concurrent_create(client: &Client, bucket: &str, layout: &HyperDirL
     assert!(created.contains(&winner), "C resolves to one of the created files");
     Ok(())
 }
+
+async fn compact_root(client: &Client, layout: &HyperDirLayout, bucket: &str) -> std::io::Result<()> {
+    let mut r = HyperDir::fs_open_root(client, layout, bucket, FileFlags::rdwr()).await?;
+    let _ = r.fs_compact().await?;
+    Ok(())
+}
+
+/// Concurrent same-source rename to two different names. A rename is a *move*:
+/// the source must end up under exactly one name, never duplicated under both
+/// (a double-name with nlink unchanged would dangle on the next unlink).
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_rename_same_source() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_concurrent_rename(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("concurrent rename flow");
+}
+
+async fn run_concurrent_rename(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    let s = create_file(client, layout, bucket, &ROOT_DIR_UUID, "s").await?;
+    compact_root(client, layout, bucket).await?; // fold "s" into the bmap (rename_within is bmap-based)
+
+    let rename = |to: &'static str| {
+        let (client, layout, bucket) = (client.clone(), layout.clone(), bucket.to_string());
+        async move {
+            let mut d = HyperDir::fs_open_root(&client, &layout, &bucket, FileFlags::rdwr()).await?;
+            d.fs_rename("s", to).await
+        }
+    };
+    let (_r1, _r2) = tokio::join!(rename("d1"), rename("d2"));
+
+    let names = dir_names(client, layout, bucket, &ROOT_DIR_UUID).await;
+    assert!(!names.contains(&"s".to_string()), "source gone, got {:?}", names);
+    let present: Vec<&String> = names.iter().filter(|n| *n == "d1" || *n == "d2").collect();
+    assert_eq!(present.len(), 1, "rename is a move: exactly one destination, got {:?}", names);
+    let dst = present[0].clone();
+    assert_eq!(resolve(client, layout, bucket, &ROOT_DIR_UUID, &dst).await, Some(s), "dest resolves to the file");
+    assert_eq!(file_nlink(client, layout, bucket, &s).await, 1, "rename leaves nlink unchanged");
+    Ok(())
+}
+
+/// Concurrent duplicate unlink of the SAME name on a 2-link file. The name is
+/// removed once, so nlink must drop by exactly one (-> 1), not two (-> 0 would
+/// make the file reclaimable while the other link still references it).
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_unlink_same_name() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_concurrent_unlink(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("concurrent unlink flow");
+}
+
+async fn run_concurrent_unlink(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    let f = create_file(client, layout, bucket, &ROOT_DIR_UUID, "f1").await?;
+    HyperDir::fs_link(client, layout, bucket, &ROOT_DIR_UUID, "f2", &f).await?; // nlink 2
+    compact_root(client, layout, bucket).await?;
+    assert_eq!(file_nlink(client, layout, bucket, &f).await, 2, "two links");
+
+    let unlink = || {
+        let (client, layout, bucket) = (client.clone(), layout.clone(), bucket.to_string());
+        async move { HyperDir::fs_unlink(&client, &layout, &bucket, &ROOT_DIR_UUID, "f1", &f, false, None).await }
+    };
+    let (_a, _b) = tokio::join!(unlink(), unlink());
+    compact_root(client, layout, bucket).await?;
+
+    let names = dir_names(client, layout, bucket, &ROOT_DIR_UUID).await;
+    assert!(!names.contains(&"f1".to_string()) && names.contains(&"f2".to_string()), "f1 gone, f2 kept: {:?}", names);
+    assert_eq!(file_nlink(client, layout, bucket, &f).await, 1, "duplicate unlink drops nlink by one, not two");
+    Ok(())
+}
+
+/// Concurrent mkdir of the same name converges to a single directory entry.
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_mkdir_same_name() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_concurrent_mkdir(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("concurrent mkdir flow");
+}
+
+async fn run_concurrent_mkdir(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    let mkdir = || {
+        let (client, layout, bucket) = (client.clone(), layout.clone(), bucket.to_string());
+        async move { HyperDir::fs_create_default(&client, &layout, &bucket, &ROOT_DIR_UUID, "d", FileFlags::rdwr(), dir_mode()).await.map(|(_, u)| u) }
+    };
+    let _ = tokio::join!(mkdir(), mkdir());
+    let names = dir_names(client, layout, bucket, &ROOT_DIR_UUID).await;
+    assert_eq!(names.iter().filter(|n| *n == "d").count(), 1, "exactly one entry named d, got {:?}", names);
+    Ok(())
+}

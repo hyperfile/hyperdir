@@ -270,16 +270,13 @@ impl<'a> HyperDir<'a>
         ).await?;
         parent_staging.emit_scatter_event(name, child_uuid, &body, DirScatterInodeOp::Delete).await?;
 
-        // Decrement the file's authoritative link count, after the tombstone
-        // so a crash in between over-counts (a storage leak fs_gc won't
-        // reclaim) rather than under-counts (premature reclamation). Only
-        // files carry hard links here; a directory has exactly one name and
-        // is reclaimed by fs_gc unconditionally.
-        if !child_is_dir {
-            if let Err(e) = adjust_nlink(client, &child_uri, -1).await {
-                warn!("fs_unlink: nlink decrement failed for {}: {}", child_uri, e);
-            }
-        }
+        // nlink is NOT decremented here. The decrement happens when compaction
+        // folds this Delete out of the bmap (see HyperDir::fs_compact): that is
+        // the single lease-serialized removal point, so duplicate/concurrent
+        // unlinks of the same name cannot over-decrement (which would reclaim a
+        // file still referenced by another link). Directories carry one name
+        // and are reclaimed by fs_gc unconditionally.
+        let _ = child_is_dir;
         Ok(())
     }
 
@@ -810,7 +807,29 @@ impl<'a> HyperDir<'a>
     pub async fn fs_compact(&mut self) -> Result<CompactStats>
     {
         debug!("fs_compact - ");
-        self.inner.compact().await
+        let stats = self.inner.compact().await?;
+        // Decrement each folded-delete child's nlink here: compaction holds the
+        // per-directory lease, so this is the single serialized point where a
+        // name is actually removed -- decrementing here (not eagerly in
+        // fs_unlink) makes nlink exactly-once even under concurrent/duplicate
+        // unlinks. A directory child has no FILE inode (NotFound) and is
+        // skipped. nlink lags until compaction, which is consistent with the
+        // deferred (tombstone) deletion model.
+        if !stats.removed_children.is_empty() {
+            let client = self.inner.staging().client.clone();
+            let bucket = self.inner.staging().bucket.clone();
+            let rp = self.inner.staging().root_path.clone();
+            let base = &rp[..rp.rfind("DIR/").unwrap_or(0)]; // "{base}DIR/{uuid}" -> "{base}"
+            for uuid in &stats.removed_children {
+                let child_uri = format!("s3://{}/{}FILE/{}", bucket, base, uuid);
+                match adjust_nlink(&client, &child_uri, -1).await {
+                    Ok(_) => {},
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}, // directory child / already gone
+                    Err(e) => warn!("fs_compact: nlink decrement failed for {}: {}", child_uri, e),
+                }
+            }
+        }
+        Ok(stats)
     }
 
     /// Rename an entry within this (already-open, writable) directory.
