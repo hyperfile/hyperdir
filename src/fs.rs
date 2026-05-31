@@ -1237,34 +1237,81 @@ async fn emit_rename_intent(
     dst_parent_uuid: &Uuid,
     dst_name: &str,
 ) -> Result<(String, RenameIntent)> {
-    let src = HyperDir::fs_open_dir(client, layout, bucket, src_parent_uuid, FileFlags::rdonly()).await?;
-    let entry_raw = src.inner.read_entry_raw(src_name).await?;
-    drop(src);
-
-    // An existing destination is overwritten: apply_rename_intent's
-    // destination-add is an upsert, so the displaced entry's btree slot is
-    // replaced in place (no tombstone). The caller reclaims the displaced
-    // child's storage.
-    let intent = RenameIntent {
-        src_parent: *src_parent_uuid,
-        src_name: src_name.to_string(),
-        dst_parent: *dst_parent_uuid,
-        dst_name: dst_name.to_string(),
-        child: Uuid::from_bytes(entry_raw.uuid),
-        inode: entry_raw.inode.as_u8_slice().to_vec(),
-    };
-
-    let txn_id = Ulid::new().to_string();
+    // Source-scoped commit point: every concurrent rename of the SAME source
+    // maps to one deterministic key, so `If-None-Match: *` admits exactly one
+    // winner. This gives cross-directory rename the same move-once guarantee
+    // same-directory rename gets from a single bmap OCC flush -- without it two
+    // concurrent renames of one source would each commit a distinct intent and
+    // leave the child reachable under two names with nlink unchanged (a dangling
+    // entry once one name is unlinked). The recovery path is key-agnostic (it
+    // parses the body), so the key format is free to change.
+    let txn_id = format!("{}_{}", src_parent_uuid, B64URL.encode(src_name));
     let key = layout.txn_key(&txn_id);
-    client.put_object()
-        .bucket(bucket)
-        .key(&key)
-        .body(SdkBody::from(intent.serialize().as_bytes()).into())
-        .if_none_match('*')
-        .send()
-        .await
-        .map_err(|e| Error::other(format!("PutObject intent s3://{}/{}: {}", bucket, key, e)))?;
-    Ok((key, intent))
+    for attempt in 0..RENAME_CLAIM_RETRIES {
+        // (Re)read the source entry. This is also the move-once check: if a
+        // concurrent winner already moved the source away, read_entry_raw is
+        // NotFound and we surface that (the loser sees ENOENT, exactly as if the
+        // two renames had been serialized).
+        let src = HyperDir::fs_open_dir(client, layout, bucket, src_parent_uuid, FileFlags::rdonly()).await?;
+        let entry_raw = src.inner.read_entry_raw(src_name).await?;
+        drop(src);
+
+        // An existing destination is overwritten: apply_rename_intent's
+        // destination-add is an upsert, so the displaced entry's btree slot is
+        // replaced in place (no tombstone). The caller reclaims the displaced
+        // child's storage.
+        let intent = RenameIntent {
+            src_parent: *src_parent_uuid,
+            src_name: src_name.to_string(),
+            dst_parent: *dst_parent_uuid,
+            dst_name: dst_name.to_string(),
+            child: Uuid::from_bytes(entry_raw.uuid),
+            inode: entry_raw.inode.as_u8_slice().to_vec(),
+        };
+
+        match client.put_object()
+            .bucket(bucket)
+            .key(&key)
+            .body(SdkBody::from(intent.serialize().as_bytes()).into())
+            .if_none_match('*')
+            .send()
+            .await
+        {
+            Ok(_) => {
+                // Won the exclusive claim. Re-verify the source survived the
+                // race: winning the claim means any prior holder has finished,
+                // and a holder removes the source before releasing its claim
+                // (foreground apply and fs_recover_renames both do), so a
+                // concurrently-moved source now reads absent. This closes the
+                // read-vs-claim TOCTOU -- without the recheck the loser could
+                // read the source as present, then win the just-freed claim and
+                // re-apply a stale move (the source under two names).
+                let src = HyperDir::fs_open_dir(client, layout, bucket, src_parent_uuid, FileFlags::rdonly()).await?;
+                let still = src.inner.read_entry_raw(src_name).await;
+                drop(src);
+                match still {
+                    Ok(e) if e.uuid == entry_raw.uuid => return Ok((key, intent)),
+                    Ok(_) => { // source replaced by a different file
+                        let _ = delete_object(client, bucket, &key).await;
+                        return Err(Error::new(ErrorKind::NotFound, "rename: source moved concurrently"));
+                    },
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        let _ = delete_object(client, bucket, &key).await;
+                        return Err(e);
+                    },
+                    Err(e) => { let _ = delete_object(client, bucket, &key).await; return Err(e); },
+                }
+            },
+            Err(e) if e.raw_response().map(|r| matches!(r.status().as_u16(), 412 | 409)).unwrap_or(false) => {
+                // Another rename of this source holds the claim: back off and
+                // recheck. It will either finish (source gone -> NotFound above)
+                // or release the claim so we can win.
+                tokio::time::sleep(Duration::from_millis(40 * (attempt as u64 + 1))).await;
+            },
+            Err(e) => return Err(Error::other(format!("PutObject intent s3://{}/{}: {}", bucket, key, e))),
+        }
+    }
+    Err(Error::new(ErrorKind::ResourceBusy, "rename: source has a concurrent rename in progress"))
 }
 
 /// Forward-apply a committed rename intent: add the entry to the destination
@@ -1320,6 +1367,11 @@ fn xattr_prefix(layout: &HyperDirLayout, uuid: &Uuid, is_dir: bool) -> String {
 /// Maximum optimistic-concurrency retries for an nlink read-modify-write.
 const NLINK_RETRIES: usize = 5;
 
+/// Bounded attempts to claim a source's cross-directory rename commit point
+/// when a concurrent rename of the same source holds it (see
+/// `emit_rename_intent`).
+const RENAME_CLAIM_RETRIES: usize = 8;
+
 /// Read-modify-write a file's authoritative `i_nlink` by `delta`, returning
 /// the new value. Uses a staging with no scatter interceptor (an nlink change
 /// is not a directory-listing event) and retries on the inode's OCC conflict.
@@ -1350,8 +1402,11 @@ async fn current_nlink(client: &Client, child_uri: &str) -> Result<Option<u64>> 
     match S3Staging::from(client, StagingConfig::new_s3_uri(child_uri, None), HyperFileRuntimeConfig::default()).await {
         Ok(staging) => {
             let mut raw: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-            let _ = staging.load_inode(raw.as_mut_u8_slice()).await?;
-            Ok(Some(raw.i_nlink))
+            match staging.load_inode(raw.as_mut_u8_slice()).await {
+                Ok(_) => Ok(Some(raw.i_nlink)),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(None), // reclaimed concurrently
+                Err(e) => Err(e),
+            }
         },
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
@@ -1387,7 +1442,14 @@ async fn reclaim_child_prefix(
 ) -> Result<()> {
     let child_config = StagingConfig::new_s3_uri(child_uri, None);
     match S3Staging::from(client, child_config, runtime_config).await {
-        Ok(child_staging) => child_staging.unlink().await,
+        // A concurrent reclaim of the same prefix may delete the inode/segments
+        // mid-flight; treat a NotFound from unlink as "already reclaimed" so
+        // reclaim is idempotent under contention.
+        Ok(child_staging) => match child_staging.unlink().await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        },
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }

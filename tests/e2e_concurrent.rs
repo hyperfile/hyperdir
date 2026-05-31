@@ -659,3 +659,54 @@ async fn run_locks(client: &Client, bucket: &str, layout: &HyperDirLayout) -> st
     }
     Ok(())
 }
+
+
+/// C1: two concurrent cross-directory renames of the SAME source to DIFFERENT
+/// destinations. A rename is a move, so the source must land under exactly one
+/// name -- never both, which would leave the file reachable under two names
+/// with nlink 1 (a dangling entry once one is unlinked). The source-scoped
+/// rename commit point admits exactly one winner.
+#[tokio::test]
+#[ignore]
+async fn e2e_concurrent_rename_across_distinct() {
+    let client = make_client().await;
+    let bucket = bucket();
+    let base = format!("hyperdir-e2e/{}", Uuid::new_v4());
+    let layout = HyperDirLayout::with_base(&base);
+    let r = run_rename_across_distinct(&client, &bucket, &layout).await;
+    purge_prefix(&client, &bucket, &format!("{}/", base)).await;
+    r.expect("concurrent rename_across distinct flow");
+}
+
+async fn run_rename_across_distinct(client: &Client, bucket: &str, layout: &HyperDirLayout) -> std::io::Result<()> {
+    HyperDir::fs_create_root(client, layout, bucket, FileFlags::rdwr(), dir_mode()).await?;
+    let d1 = mkdir(client, layout, bucket, &ROOT_DIR_UUID, "x1").await?;
+    let d2 = mkdir(client, layout, bucket, &ROOT_DIR_UUID, "x2").await?;
+    compact_root(client, layout, bucket).await?;
+    for i in 0..RACES {
+        let (s, a, b) = (format!("s{i}"), format!("a{i}"), format!("b{i}"));
+        let f = create_file(client, layout, bucket, &d1, &s).await?;
+        compact_dir(client, layout, bucket, &d1).await?;
+
+        let f1 = {
+            let (client, layout, bucket, s, a) = (client.clone(), layout.clone(), bucket.to_string(), s.clone(), a.clone());
+            async move { HyperDir::fs_rename_across(&client, &layout, &bucket, &d1, &s, &d2, &a).await }
+        };
+        let f2 = {
+            let (client, layout, bucket, s, b) = (client.clone(), layout.clone(), bucket.to_string(), s.clone(), b.clone());
+            async move { HyperDir::fs_rename_across(&client, &layout, &bucket, &d1, &s, &d2, &b).await }
+        };
+        let (_r1, _r2) = tokio::join!(f1, f2); // exactly one wins; the loser sees the source moved (ENOENT)
+
+        compact_dir(client, layout, bucket, &d1).await?;
+        compact_dir(client, layout, bucket, &d2).await?;
+
+        assert!(!dir_names(client, layout, bucket, &d1).await.contains(&s), "source gone from x1");
+        let names2 = dir_names(client, layout, bucket, &d2).await;
+        let present: Vec<&String> = names2.iter().filter(|n| **n == a || **n == b).collect();
+        assert_eq!(present.len(), 1, "move-once: source lands under exactly one name, got {names2:?}");
+        assert_eq!(resolve(client, layout, bucket, &d2, present[0]).await, Some(f), "destination resolves to the moved file");
+        assert_eq!(file_nlink(client, layout, bucket, &f).await, 1, "rename leaves nlink unchanged");
+    }
+    Ok(())
+}
