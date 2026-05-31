@@ -90,7 +90,7 @@ impl DirFileEntry {
 pub(crate) type EntryNameHash = u64;
 
 /// Statistics returned from [`HyperDirFile::compact`].
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone)]
 pub struct CompactStats {
     /// Number of scatter objects listed and processed in this round.
     pub scatters_processed: usize,
@@ -105,6 +105,11 @@ pub struct CompactStats {
     /// True when the scatter list was empty; flush + scatter cleanup were
     /// skipped and this call had no S3 side effects.
     pub no_op: bool,
+    /// Child UUIDs whose Delete was actually folded out of the bmap this pass.
+    /// The caller decrements each child file's nlink once; doing it here (the
+    /// single lease-serialized fold point) makes nlink exactly-once even under
+    /// concurrent/duplicate unlinks.
+    pub removed_children: Vec<Uuid>,
 }
 
 /// Internal: the result of listing + classifying + body-fetching scatter
@@ -120,8 +125,10 @@ struct ScatterChanges {
     /// Update. Keyed by the full filename (not its hash) so two distinct
     /// names that share a CRC64 are both preserved within one batch.
     upserts: HashMap<String, DirFileEntryRaw>,
-    /// Filenames whose latest scatter is Delete.
-    deletes: HashSet<String>,
+    /// Filenames whose latest scatter is Delete, mapped to the child UUID
+    /// (so compaction can decrement that child's nlink exactly once when it
+    /// folds the delete -- the single lease-serialized removal point).
+    deletes: HashMap<String, Uuid>,
     /// Subset of `all_keys`: the latest Delete scatter per filename. These
     /// must NOT be deleted by `compact`; they remain in S3 as tombstones
     /// until `fs_gc` reclaims them after their retention expires.
@@ -477,7 +484,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         for (name, entry) in changes.upserts {
             view.insert(name, entry);
         }
-        for name in &changes.deletes {
+        for name in changes.deletes.keys() {
             view.remove(name);
         }
 
@@ -539,9 +546,15 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
         }
 
         let mut entries_removed = 0;
-        for name in &changes.deletes {
+        let mut removed_children: Vec<Uuid> = Vec::new();
+        for (name, child_uuid) in &changes.deletes {
             if self.probe_delete(name.as_bytes()).await? {
                 entries_removed += 1;
+                // The name actually transitioned present -> absent here; the
+                // caller decrements this child's nlink exactly once. A later
+                // compact sees the (kept) tombstone again but probe_delete
+                // returns false, so it is not double-counted.
+                removed_children.push(*child_uuid);
             }
             // A tombstone for a name that was never persisted (created and
             // deleted before any compact ran, or already consolidated) just
@@ -569,6 +582,7 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             entries_removed,
             tombstones_kept,
             no_op: false,
+            removed_children,
         })
     }
 
@@ -616,9 +630,9 @@ impl<'a, T, L> HyperDirFile<'a, T, L>
             upserts.insert(s.filename, entry);
         }
 
-        let mut deletes: HashSet<String> = HashSet::new();
+        let mut deletes: HashMap<String, Uuid> = HashMap::new();
         for s in to_remove {
-            deletes.insert(s.filename);
+            deletes.insert(s.filename, s.uuid);
         }
 
         Ok(ScatterChanges { all_keys, upserts, deletes, tombstone_keys })
