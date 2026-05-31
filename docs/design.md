@@ -418,7 +418,7 @@ or an exclusive claim, makes them safe — never atomic across objects):
   converges to the single destination name);
 - reclaim-intent crash recovery (a replace-over-existing rename recorded the
   displaced child in a `.reclaim` intent then crashed; recovery reclaims the
-  orphan, and leaves a still-named child untouched).
+  orphan, and leaves a still-named child untouched);
 - phase-2-delete crash (tombstone written, nlink not decremented): `fs_gc`
   refuses the stale-high-nlink child, `fs_gc_orphans` reclaims it;
 - hard-link crash (nlink bumped, entry not inserted): the over-counted file is
